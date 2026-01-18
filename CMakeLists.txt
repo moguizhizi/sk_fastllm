@@ -238,6 +238,17 @@ if (USE_CUDA)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
 
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
+
+
+    # --- 新增 Driver API 链接 ---
+    find_library(CUDA_DRIVER_LIBRARY cuda HINTS /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu)
+    if(CUDA_DRIVER_LIBRARY)
+        message(STATUS "Linking CUDA Driver library: ${CUDA_DRIVER_LIBRARY}")
+        list(APPEND FASTLLM_LINKED_LIBS ${CUDA_DRIVER_LIBRARY})
+    else()
+        message(FATAL_ERROR "Cannot find CUDA Driver library (libcuda.so)")
+    endif()
+
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
 endif()
 
