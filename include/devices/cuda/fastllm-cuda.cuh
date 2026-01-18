@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 #define FASTLLM_CUDA_MAX_DEVICES       16
+#define FASTLLM_CUDA_NAME "CUDA"
 
 struct CUDAInstructInfo {
     int device_count;
