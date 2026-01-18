@@ -72,6 +72,8 @@ namespace fastllm {
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
         this->ops["AppendKVCachebatch"] = (BaseOperator*)(new CudaAppendKVCacheBatchOp());
         this->ops["AttentionBatch"] = (BaseOperator*)(new CudaAttentionBatchOp());
+
+        CUDAInstructInfo CUDAInstructInfo;
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {
