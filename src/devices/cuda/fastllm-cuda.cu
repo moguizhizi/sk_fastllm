@@ -196,102 +196,47 @@ struct CudaInfos {
 };
 
 CUDAInstructInfo::CUDAInstructInfo() {
-    cudaError_t err = cudaGetDeviceCount(&device_count);
-    if (err != cudaSuccess) {
-        printf("cudaGetDeviceCount returned %d\n-> %s\n", (int)err, cudaGetErrorString(err));
+    cudaError_t cudaErr = cudaGetDeviceCount(&device_count);
+    if (cudaErr != cudaSuccess) {
+        printf("cudaGetDeviceCount returned %d\n-> %s\n", (int)cudaErr, cudaGetErrorString(cudaErr));
     }
 
     fastllm::AssertInFastLLM(device_count <= FASTLLM_CUDA_MAX_DEVICES, "Number of CUDA devices (" + std::to_string(device_count) +
                                                                            ") exceeds the maximum supported (" +
                                                                            std::to_string(FASTLLM_CUDA_MAX_DEVICES) + ")");
 
-//     int64_t total_vram = 0;
-//     GGML_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices:\n", __func__, info.device_count);
+    int64_t total_vram = 0;
+    printf("%s: found %d " FASTLLM_CUDA_NAME " devices:\n", __func__, device_count);
 
-//     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
-//     for (int id = 0; id < info.device_count; ++id) {
-//         int device_vmm = 0;
+    std::vector<std::pair<int, std::string>> turing_devices_without_mma;
+    for (int id = 0; id < device_count; ++id) {
+        int device_vmm = 0;
 
-// #if defined(GGML_USE_VMM)
-//         CUdevice device;
-//         CU_CHECK(cuDeviceGet(&device, id));
-//         CU_CHECK(cuDeviceGetAttribute(&device_vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
+        CUdevice device;
+        CUresult cuResultErr = cuDeviceGet(&device, id);
+        if (cuResultErr != CUDA_SUCCESS) {
+            const char *errStr = nullptr;
+            cuGetErrorString(cuResultErr, &errStr);
+            printf("Failed to get properties for device %d: %s (error code %d)\n", id, errStr ? errStr : "Unknown", (int)cuResultErr);
+            continue;
+        }
 
-//         if (device_vmm) {
-//             CUmemAllocationProp alloc_prop = {};
-//             alloc_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-//             alloc_prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-//             alloc_prop.location.id = id;
-//             CU_CHECK(cuMemGetAllocationGranularity(&info.devices[id].vmm_granularity, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-//         }
-// #endif // defined(GGML_USE_VMM)
-//         info.devices[id].vmm = !!device_vmm;
+        cuResultErr = cuDeviceGetAttribute(&device_vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device);
+        if (cuResultErr != CUDA_SUCCESS) {
+            const char *errStr = nullptr;
+            cuGetErrorString(cuResultErr, &errStr);
+            printf("Failed to get VMM attribute for device %d: %s\n", device, errStr ? errStr : "Unknown");
+        }
 
-//         cudaDeviceProp prop;
-//         CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
+        cudaDeviceProp prop;
+        cudaErr = cudaGetDeviceProperties(&prop, id);
+        if (cudaErr != cudaSuccess) {
+            printf("Failed to get properties for device %d: %s (error code %d)\n", id, cudaGetErrorString(cudaErr), (int)cuResultErr);
+            continue;
+        }
 
-//         info.default_tensor_split[id] = total_vram;
-//         total_vram += prop.totalGlobalMem;
-//         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
-//         info.devices[id].nsm        = prop.multiProcessorCount;
-//         info.devices[id].smpb       = prop.sharedMemPerBlock;
-//         info.devices[id].warp_size  = prop.warpSize;
-
-// #ifndef GGML_USE_MUSA
-//         int supports_coop_launch = 0;
-//         CUDA_CHECK(cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, id));
-//         info.devices[id].supports_cooperative_launch = !!supports_coop_launch;
-// #else
-//         info.devices[id].supports_cooperative_launch = false;
-// #endif // !(GGML_USE_MUSA)
-// #if defined(GGML_USE_HIP)
-//         info.devices[id].smpbo = prop.sharedMemPerBlock;
-
-//         info.devices[id].cc = ggml_cuda_parse_id(prop.gcnArchName);
-//         if ((info.devices[id].cc & 0xff00) == 0x0) {
-//             GGML_LOG_WARN("invalid architecture ID received for device %d %s: %s  cc %d.%d\n",
-//                             id, prop.name, prop.gcnArchName, prop.major, prop.minor);
-
-//             // Fallback to prop.major and prop.minor
-//             if (prop.major > 0) {
-//                 info.devices[id].cc = GGML_CUDA_CC_OFFSET_AMD + prop.major * 0x100;
-//                 info.devices[id].cc += prop.minor * 0x10;
-//             }
-//         }
-//         GGML_LOG_INFO("  Device %d: %s, %s (0x%x), VMM: %s, Wave Size: %d\n",
-//                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
-//                       device_vmm ? "yes" : "no", prop.warpSize);
-// #elif defined(GGML_USE_MUSA)
-//         // FIXME: Ensure compatibility with varying warp sizes across different MUSA archs.
-//         info.devices[id].warp_size = 32;
-//         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
-//         info.devices[id].cc = GGML_CUDA_CC_OFFSET_MTHREADS + prop.major * 0x100;
-//         info.devices[id].cc += prop.minor * 0x10;
-//         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n",
-//                         id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
-// #else
-//         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
-//         info.devices[id].cc = 100*prop.major + 10*prop.minor;
-//         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n",
-//                         id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
-//         std::string device_name(prop.name);
-//         if (device_name == "NVIDIA GeForce MX450") {
-//             turing_devices_without_mma.push_back({ id, device_name });
-//         } else if (device_name == "NVIDIA GeForce MX550") {
-//             turing_devices_without_mma.push_back({ id, device_name });
-//         } else if (device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
-//             turing_devices_without_mma.push_back({ id, device_name });
-//         }
-
-//         // Temporary performance fix:
-//         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
-//         // TODO: Check for future drivers the default scheduling strategy and
-//         // remove this call again when cudaDeviceScheduleSpin is default.
-//         if (prop.major == 12 && prop.minor == 1) {
-//             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
-//         }
-
-// #endif  // defined(GGML_USE_HIP)
+        printf("  Device %d: %s, compute capability %d.%d, VMM: %s\n", id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
+    }
 }
 
 CudaInfos *cudaInfos = nullptr;
