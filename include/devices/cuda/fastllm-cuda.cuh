@@ -6,6 +6,13 @@ std::vector <long long> FastllmCudaGetFreeSizes();
 extern "C" {
 #endif
 
+#define FASTLLM_CUDA_MAX_DEVICES       16
+
+struct CUDAInstructInfo {
+    int device_count;
+    CUDAInstructInfo();
+};
+
 void ForceDeviceSync();
 void FastllmInitCublas(void);
 
