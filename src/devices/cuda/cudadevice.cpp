@@ -35,6 +35,7 @@ namespace fastllm {
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
+        this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
@@ -55,6 +56,7 @@ namespace fastllm {
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CudaAlibiMaskOp());
         this->ops["TransferAttn"] = (BaseOperator*)(new CudaTransferAttnOp());
+        this->ops["ApplyChunkDecayByLastLogG"] = (BaseOperator*)(new CudaApplyChunkDecayByLastLogGOp());
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
         this->ops["SelectExpert"] = (BaseOperator*)(new CudaSelectExpertOp());
@@ -72,6 +74,7 @@ namespace fastllm {
         this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
         this->ops["MergeMLAPaged"] = (BaseOperator*)(new CudaMergeMLAPaged());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
+        this->ops["ChunkGatedDeltaRulePrefill"] = (BaseOperator*)(new CudaChunkGatedDeltaRulePrefillOp());
         this->ops["CausalMask"] = (BaseOperator*)(new CudaCausalMaskOp());
         this->ops["MakeDecayMask"] = (BaseOperator*)(new CudaMakeDecayMaskOp());
 
@@ -890,6 +893,36 @@ namespace fastllm {
                                             input1.dims[axis] * inner * unitSize, outer);
     }
 
+    void CudaPadOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int padSize = intParams.find("padSize") != intParams.end() ? intParams.find("padSize")->second : 0;
+        AssertInFastLLM(padSize >= 0, "Pad Error: padSize should be non-negative.");
+        if (input.dims.empty() || padSize == 0) {
+            output.CopyFrom(input);
+            return;
+        }
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        output.Allocate();
+        FastllmCudaMemset0(output.cudaData, output.GetBytes());
+
+        int outer = output.Count(0) / output.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) output.cudaData, outputStride * unitSize,
+                                          (uint8_t *) input.cudaData, inputStride * unitSize,
+                                          input.dims[axis] * inner * unitSize, outer);
+    }
+
     void DoCudaCatDirect(Data &input0, Data &input1, int axis) {
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                                 (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
@@ -1286,6 +1319,22 @@ namespace fastllm {
         FastllmCudaTransferAttn(input);
     }
 
+    void CudaApplyChunkDecayByLastLogGOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &g = *(datas.find("g")->second);
+        AssertInFastLLM((input.dataType == DataType::FLOAT32 && g.dataType == DataType::FLOAT32) ||
+                        (input.dataType == DataType::FLOAT16 && g.dataType == DataType::FLOAT16) ||
+                        (input.dataType == DataType::BFLOAT16 && g.dataType == DataType::BFLOAT16),
+                        "ApplyChunkDecayByLastLogG's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input.dims.size() >= 2 && g.dims.size() >= 1,
+                        "ApplyChunkDecayByLastLogG error: invalid dims.\n");
+        int dim = input.dims[input.dims.size() - 2];
+        AssertInFastLLM(g.dims.back() == dim && input.Count(0) == g.Count(0) * input.dims.back(),
+                        "ApplyChunkDecayByLastLogG error: input and g shape mismatch.\n");
+        FastllmCudaApplyChunkDecayByLastLogG(input, g);
+    }
+
     void CudaCumSumLastDimOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -1555,6 +1604,19 @@ namespace fastllm {
         Data &core_attn_out = *(datas.find("core_attn_out")->second);
         core_attn_out.Allocate();
         FastllmRecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out);
+    }
+
+    void CudaChunkGatedDeltaRulePrefillOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &attn = *(datas.find("attn")->second);
+        Data &k_cumdecay = *(datas.find("k_cumdecay")->second);
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        FastllmChunkGatedDeltaRulePrefill(q, k, v, g, attn, k_cumdecay, last_recurrent_state, core_attn_out);
     }
 
     void CudaCausalMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,

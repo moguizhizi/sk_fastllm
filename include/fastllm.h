@@ -32,6 +32,22 @@
 namespace fastllm {
     class Data;
 
+    class FastllmEnv {
+    public:
+        FastllmEnv();
+
+        bool activateNuma = false;
+        int numaThreads = -1;
+        int numas = -1;
+        bool cudaSync = false;
+        bool printLogits = false;
+        bool useFusedTransferAttn = true;
+        bool useFusedGdnPrefill = true;
+        std::string debugTokenId;
+    };
+
+    const FastllmEnv &GetFastllmEnv();
+
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
     void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
 
@@ -801,6 +817,8 @@ namespace fastllm {
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
+    void Pad(const Data &input, int axis, int padSize, Data &output);
+
     void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
 
     void MatMul(const Data &input0, const Data &input1, Data &output, float alpha = 1.0, int group = 1);
@@ -840,6 +858,10 @@ namespace fastllm {
     void TransferAttn(Data &input);
 
     void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
+                                Data &last_recurrent_state, Data &core_attn_out);
+
+    void ChunkGatedDeltaRulePrefill(Data &q, Data &k, Data &v, Data &g,
+                                Data &attn, Data &k_cumdecay,
                                 Data &last_recurrent_state, Data &core_attn_out);
 
     void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha
@@ -896,6 +918,8 @@ namespace fastllm {
     void CumSumLastDim(Data &input);
 
     void MakeDecayMask(Data &input, Data &output);
+
+    void ApplyChunkDecayByLastLogG(Data &input, const Data &g);
 
     void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output);
 

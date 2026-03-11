@@ -185,6 +185,7 @@ bool FastllmCudaTransferAttn(fastllm::Data &input);
 bool FastllmCudaCumSumLastDim(fastllm::Data &input);
 bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue);
 bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::Data &g);
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
@@ -291,6 +292,9 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     const std::vector<int> eos_nums, const std::vector<int> eos_ids);
 
 void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);
+void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);
 
 void FastllmCudaSetDevice(int gpu_id);
 int FastllmCudaGetDevice();

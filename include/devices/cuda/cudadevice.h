@@ -115,6 +115,10 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaChunkGatedDeltaRulePrefillOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaLinearOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
@@ -143,6 +147,10 @@ namespace fastllm {
     };
 
     class CudaCatOp : CpuCatOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaPadOp : CpuPadOp {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -228,6 +236,10 @@ namespace fastllm {
     };
 
     class CudaCumSumLastDimOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaApplyChunkDecayByLastLogGOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

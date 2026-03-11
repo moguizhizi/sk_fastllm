@@ -11,26 +11,14 @@
 #include <unordered_map>
 
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
-    static void FakePad(Data &input, Data &output, int axis, int dim) {
-        if (dim == 0) {
-            Mul(input, 1.0f, output);
-            return;
-        }
-        Data temp;
-        std::vector <int> dims = input.dims;
-        dims[axis] = dim;
-        temp.Resize(dims);
-        temp.Allocate(0.0f);
-        ToDataType(temp, input.dataType);
-        Cat(input, temp, axis, output);
-    }
-
     static void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -78,7 +66,10 @@ namespace fastllm {
             language_prefix + "layers.*.self_attn.o_proj.weight", language_prefix + "layers.*.self_attn.q_proj.weight",
             language_prefix + "layers.*.self_attn.k_proj.weight",
             language_prefix + "layers.*.self_attn.v_proj.weight", language_prefix + "layers.*.self_attn.mergeqkv.weight",
-            language_prefix + "layers.*.self_attn.W_pack.weight"
+            language_prefix + "layers.*.self_attn.W_pack.weight",
+            language_prefix + "layers.*.linear_attn.in_proj_qkvz.weight",
+            language_prefix + "layers.*.linear_attn.in_proj_ba.weight",
+            language_prefix + "layers.*.linear_attn.out_proj.weight"
         };
     }
 
@@ -152,7 +143,7 @@ namespace fastllm {
             this->weightMergeRules.push_back(
                 WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
             );
-/*
+
             std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -165,8 +156,27 @@ namespace fastllm {
                 WeightMergeRule({WeightMergeRuleSingle({qWeightName, kWeightName, vWeightName}, mergeQkvWeightName, std::string("linear")),
                                  WeightMergeRuleSingle({qBiasName, kBiasName, vBiasName}, mergeQkvBiasName, std::string("bias"))})
             );
-*/
+
+            // Merge GDN linear projections: qkv + z -> qkvz, b + a -> ba
+            std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
+            std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
+            std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({qkvWeightName, zWeightName}, qkvzWeightName, std::string("linear"))})
+            );
+
+            std::string bWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_b.weight";
+            std::string aWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_a.weight";
+            std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({bWeightName, aWeightName}, baWeightName, std::string("linear"))})
+            );
         }
+
+        float inv_scale = pow((float)head_k_dim, -0.5);
+        std::vector <float> v_inv_scale(head_k_dim, inv_scale);
+        Data temp(DataType::FLOAT32, std::vector<int>{head_k_dim}, v_inv_scale);
+        inv_scale_data.CopyFrom(temp);
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
@@ -229,7 +239,6 @@ namespace fastllm {
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
         }
-        bool isPrefill = !all1;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
             std::vector <float> vPositionIds;            
             for (int b = 0; b < batch; b++) {
@@ -285,27 +294,37 @@ namespace fastllm {
             Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
 
             if (weight.weight.find(language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight") != weight.weight.end()) {
+                // Gate Attention Block
                 std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
                 std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
                 std::string kWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.weight";
                 std::string kBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.bias";
                 std::string vWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.weight";
                 std::string vBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.bias";
-                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.W_pack.weight";
                 std::string oWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight";
                 std::string oBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.bias";
                 std::string mergeQkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
                 std::string mergeQkvBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
 
-                Data qgate, q, gate, k, v;
-                Linear(attenInput, weight[qWeightName], weight[qBiasName], qgate);
+                Data qgate, q, gate, k, v, mergedQkv;
+                if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+                    Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], mergedQkv);
+
+                    int qgateDim = num_attention_heads * this->head_dim * 2;
+                    int kvDim = num_key_value_heads * this->head_dim;
+                    Split(mergedQkv, -1, 0, qgateDim, qgate);
+                    Split(mergedQkv, -1, qgateDim, qgateDim + kvDim, k);
+                    Split(mergedQkv, -1, qgateDim + kvDim, qgateDim + kvDim * 2, v);
+                } else {
+                    Linear(attenInput, weight[qWeightName], weight[qBiasName], qgate);
+                    Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
+                    Linear(attenInput, weight[vWeightName], weight[vBiasName], v);
+                }
+
                 qgate.Reshape({bsz, seqlen, -1, this->head_dim * 2});
                 Split(qgate, -1, 0, this->head_dim, q);
                 Split(qgate, -1, this->head_dim, qgate.dims.back(), gate);
                 gate.Reshape({bsz, seqlen, -1});
-
-                Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
-                Linear(attenInput, weight[vWeightName], weight[vBiasName], v);                
 
                 k.Reshape({bsz, seqlen, -1, this->head_dim});
                 v.Reshape({bsz, seqlen, -1, this->head_dim});
@@ -347,12 +366,11 @@ namespace fastllm {
                 Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
             } else {
+                // Gated Delta Net Block
                 Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
                 pastKey.isLinearAttention = pastValue.isLinearAttention = true;
-                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
-                std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
-                std::string bWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_b.weight";
-                std::string aWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_a.weight";
+                std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
+                std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
                 std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
                 std::string conv1dBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.bias";
                 std::string aLogName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.A_log";
@@ -360,11 +378,20 @@ namespace fastllm {
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
 
-                Data mixed_qkv, z, b, a, g;
-                Linear(attenInput, weight[qkvWeightName], Data(), mixed_qkv);
-                Linear(attenInput, weight[zWeightName], Data(), z);
-                Linear(attenInput, weight[bWeightName], Data(), b);
-                Linear(attenInput, weight[aWeightName], Data(), a);
+                // Optimization 1: Merge 4 Linear calls into 2
+                // qkv+z fused into one Linear, b+a fused into one Linear
+                Data mixed_qkvz, ba_merged, mixed_qkv, z, b, a, g;
+                Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
+                Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+
+                // Split qkvz -> mixed_qkv + z
+                int qkvz_dim = kd * 2 + vd;
+                Split(mixed_qkvz, -1, 0, qkvz_dim, mixed_qkv);
+                Split(mixed_qkvz, -1, qkvz_dim, qkvz_dim + vd, z);
+
+                // Split ba -> b + a (note: b and a have dim num_v_heads, not vd)
+                Split(ba_merged, -1, 0, num_v_heads, b);
+                Split(ba_merged, -1, num_v_heads, num_v_heads * 2, a);
 
                 // mixed_qkv: (bsz, seqlen, key_dim*2+value_dim) -> transpose to (bsz, key_dim*2+value_dim, seqlen)
                 PermuteSelf(mixed_qkv, {0, 2, 1});
@@ -413,26 +440,8 @@ namespace fastllm {
                 Sigmoid(b, b);
                 MambaSoftplus(a, weight[aLogName], weight[dtBiasName], g);
 
-                if (num_v_heads / num_k_heads > 1) {
-                    Data qtemp, ktemp;
-                    Mul(q, 1.0f, qtemp);
-                    Mul(k, 1.0f, ktemp);
-
-                    qtemp.Resize({q.dims[0], q.dims[1], q.dims[2], 1, q.dims[3]});
-                    ktemp.Resize({k.dims[0], k.dims[1], k.dims[2], 1, k.dims[3]});
-
-                    Repeat(qtemp, 3, num_v_heads / num_k_heads, q);
-                    Repeat(ktemp, 3, num_v_heads / num_k_heads, k);
-
-                    q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
-                    k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
-                }
 
                 Data &last_recurrent_state = pastValue;
-
-                float inv_scale = pow((float)head_k_dim, -0.5);
-                std::vector <float> v_inv_scale = std::vector <float> (head_k_dim, inv_scale);
-                Data inv_scale_data = Data(DataType::FLOAT32, std::vector<int>{head_k_dim}, v_inv_scale);
 
                 Data core_attn_out, core_attn_out_temp;
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
@@ -461,6 +470,21 @@ namespace fastllm {
                     PermuteSelf(core_attn_out, {0, 2, 1, 3});
                 } else {
                     // torch_chunk_gated_delta_rule
+                    if (num_v_heads / num_k_heads > 1) {
+                        Data qrepeat, krepeat;
+                        Mul(q, 1.0f, qrepeat);
+                        Mul(k, 1.0f, krepeat);
+
+                        qrepeat.Resize({q.dims[0], q.dims[1], q.dims[2], 1, q.dims[3]});
+                        krepeat.Resize({k.dims[0], k.dims[1], k.dims[2], 1, k.dims[3]});
+
+                        Repeat(qrepeat, 3, num_v_heads / num_k_heads, q);
+                        Repeat(krepeat, 3, num_v_heads / num_k_heads, k);
+
+                        q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
+                        k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
+                    }
+
                     {
                         RMSNorm(q, inv_scale_data, rms_norm_eps, q);
                         RMSNorm(k, inv_scale_data, rms_norm_eps, k);
@@ -479,123 +503,177 @@ namespace fastllm {
                     int seq = k.dims[2];
                     int pad_size = (chunk_size - seq % chunk_size) % chunk_size;
 
-                    Data qtemp, qq, kk, vv, bb, gg, decayMask;
-                    {
-                        FakePad(q, qtemp, 2, pad_size);
-                        FakePad(k, kk, 2, pad_size);
-                        FakePad(v, vv, 2, pad_size);
-                        FakePad(b, bb, 2, pad_size);
-                        FakePad(g, gg, 2, pad_size);
+                    Data qq, kk, vv, bb, gg, decayMask;
+                    Data qq_pad, kk_pad, vv_pad, bb_pad, gg_pad; // used only when pad_size > 0
+                    Data *pkk, *pvv, *pbb, *pgg;
+                    if (pad_size > 0) {
+                        Data qtemp;
+                        Pad(q, 2, pad_size, qtemp);
+                        Pad(k, 2, pad_size, kk_pad);
+                        Pad(v, 2, pad_size, vv_pad);
+                        Pad(b, 2, pad_size, bb_pad);
+                        Pad(g, 2, pad_size, gg_pad);
+                        float scale = 1.0f / pow(qtemp.dims.back(), 0.5);
+                        Mul(qtemp, scale, qq);
+                        pkk = &kk_pad; pvv = &vv_pad; pbb = &bb_pad; pgg = &gg_pad;
+                    } else {
+                        // Avoid 5 Mul(x, 1.0f, y) copies when no padding needed
+                        float scale = 1.0f / pow(q.dims.back(), 0.5);
+                        Mul(q, scale, qq);
+                        pkk = &k; pvv = &v; pbb = &b; pgg = &g;
                     }
 
                     int tot_heads = seq + pad_size;
-                    float scale = 1.0f / pow(qtemp.dims.back(), 0.5);
-                    Mul(qtemp, scale, qq);
 
-                    bb.Resize({bb.dims[0], bb.dims[1], bb.dims[2], 1});
+                    pbb->Resize({(*pbb).dims[0], (*pbb).dims[1], (*pbb).dims[2], 1});
                     Data k_beta, v_beta;
-                    Mul(kk, 1.0f, k_beta);
-                    Mul(vv, 1.0f, v_beta);
-                    MulTo(k_beta, bb);
-                    MulTo(v_beta, bb);
+                    Mul(*pkk, 1.0f, k_beta);
+                    Mul(*pvv, 1.0f, v_beta);
+                    MulTo(k_beta, *pbb);
+                    MulTo(v_beta, *pbb);
 
                     qq.Reshape({qq.dims[0], qq.dims[1], -1, chunk_size, qq.dims.back()});
-                    kk.Reshape({kk.dims[0], kk.dims[1], -1, chunk_size, kk.dims.back()});
+                    pkk->Reshape({(*pkk).dims[0], (*pkk).dims[1], -1, chunk_size, (*pkk).dims.back()});
                     k_beta.Reshape({k_beta.dims[0], k_beta.dims[1], -1, chunk_size, k_beta.dims.back()});
                     v_beta.Reshape({v_beta.dims[0], v_beta.dims[1], -1, chunk_size, v_beta.dims.back()});
-                    gg.Reshape({gg.dims[0], gg.dims[1], -1, chunk_size});
+                    pgg->Reshape({(*pgg).dims[0], (*pgg).dims[1], -1, chunk_size});
 
-                    CumSumLastDim(gg);
-                    MakeDecayMask(gg, decayMask);
+                    CumSumLastDim(*pgg);
+                    MakeDecayMask(*pgg, decayMask);
 
                     Data at, attn;
-                    MatMulTransB(k_beta, kk, at);
+                    MatMulTransB(k_beta, *pkk, at);
                     Mul(at, -1.0f, attn);
                     MulTo(attn, decayMask);
 
                     CausalMask(attn, 0, 0.0f);
                     TransferAttn(attn);
                     MatMul(attn, v_beta, vv);
-                    Data k_temp, k_cumdecay;                    
-                    Exp(gg, g);
+                    Data k_cumdecay, g_exp;                    
+                    Exp(*pgg, g_exp);
 
-                    Mul(k_beta, 1.0f, k_temp);
-                    MulTo(k_temp, g);
-                    MatMul(attn, k_temp, k_cumdecay);
+                    // Optimization: avoid k_temp copy - MulTo k_beta directly since k_beta is not used after this
+                    MulTo(k_beta, g_exp);
+                    MatMul(attn, k_beta, k_cumdecay);
+
+                    MatMulTransB(qq, *pkk, attn);
+                    MulTo(attn, decayMask);
+                    CausalMask(attn, 1, 0.0f);
 
                     if (last_recurrent_state.dims.size() == 0) {
+#ifdef USE_CUDA
+                        if (qq.dataDevice == DataDevice::CUDA) {
+                            last_recurrent_state.dataDevice = qq.dataDevice;
+                            last_recurrent_state.dataDeviceIds = qq.dataDeviceIds;
+                        }
+#endif
                         last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim_local});
                         last_recurrent_state.Allocate(0.0f);
                     }
 
-                    for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
-                        Data q_i, k_i, v_i, decay_mask_i, k_cumdecay_i;
-                        Split(qq, 2, ci, ci + 1, q_i);
-                        Split(kk, 2, ci, ci + 1, k_i);
-                        Split(vv, 2, ci, ci + 1, v_i);
+                    auto runChunkPrefillReference = [&](Data &state, Data &out) {
+                        auto makeChunk4D = [](Data &src, int idx, Data &dst) {
+                            dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
+                            dst.strides = {src.strides[1], src.strides[2], src.strides[3], src.strides[4]};
+                            dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
+                        };
+                        auto makeChunk3D = [](Data &src, int idx, Data &dst) {
+                            dst.dims = {src.dims[1], src.dims[2], src.dims[3]};
+                            dst.strides = {src.strides[1], src.strides[2], src.strides[3]};
+                            dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
+                        };
 
-                        q_i.Resize({q_i.dims[0], q_i.dims[1], q_i.dims[3], q_i.dims[4]});
-                        k_i.Resize({k_i.dims[0], k_i.dims[1], k_i.dims[3], k_i.dims[4]});
-                        v_i.Resize({v_i.dims[0], v_i.dims[1], v_i.dims[3], v_i.dims[4]});
+                        for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
+                            Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
+                            makeChunk4D(qq, ci, q_i);
+                            makeChunk4D(*pkk, ci, k_i);
+                            makeChunk4D(vv, ci, v_i);
+                            makeChunk4D(attn, ci, attn_i);
+                            makeChunk4D(k_cumdecay, ci, k_cumdecay_i);
 
-                        Split(decayMask, 2, ci, ci + 1, decay_mask_i);
-                        decay_mask_i.Resize({decay_mask_i.dims[0], decay_mask_i.dims[1], decay_mask_i.dims[3], decay_mask_i.dims[4]});
+                            Data v_prime, v_new;
+                            MatMul(k_cumdecay_i, state, v_prime);
+                            Mul(v_prime, -1.0f, v_new);
+                            AddTo(v_new, v_i);
 
-                        MatMulTransB(q_i, k_i, attn);
-                        MulTo(attn, decay_mask_i);
-                        CausalMask(attn, 1, 0.0f);
+                            Data attn_inter, g_i, g_i_exp;
+                            makeChunk3D(*pgg, ci, g_i);
+                            makeChunk3D(g_exp, ci, g_i_exp);
+                            g_i_exp.Resize({g_i_exp.dims[0], g_i_exp.dims[1], g_i_exp.dims[2], 1});
+                            MulTo(q_i, g_i_exp);
 
-                        Split(k_cumdecay, 2, ci, ci + 1, k_cumdecay_i);
-                        k_cumdecay_i.Resize({k_cumdecay_i.dims[0], k_cumdecay_i.dims[1], k_cumdecay_i.dims[3], k_cumdecay_i.dims[4]});
+                            MatMul(q_i, state, attn_inter);
+                            Data atv;
+                            MatMul(attn_i, v_new, atv);
+                            AddTo(atv, attn_inter);
+                            atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
+                            if (ci == 0) {
+                                Mul(atv, 1.0f, out);
+                            } else {
+                                Mul(out, 1.0f, core_attn_out_temp);
+                                Cat(core_attn_out_temp, atv, 3, out);
+                            }
 
-                        Data v_prime, v_new;
-                        MatMul(k_cumdecay_i, last_recurrent_state, v_prime);
-                        Mul(v_prime, -1.0f, v_new);
-                        AddTo(v_new, v_i);
+                            Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
+                            Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
+                            Repeat(g_i_last, 2, g_i.dims[2], g_i_last_repeat);
+                            Mul(g_i, -1.0f, g_i_delta);
+                            AddTo(g_i_last_repeat, g_i_delta);
+                            Exp(g_i_last_repeat, g_i_scale);
+                            g_i_scale.Resize({g_i_scale.dims[0], g_i_scale.dims[1], g_i_scale.dims[2], 1});
+                            MulTo(k_i, g_i_scale);
 
-                        Data attn_inter, g_i, g_i_exp, q_i_temp;
-                        Split(gg, 2, ci, ci + 1, g_i);
-                        g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[3], 1});
-                        Exp(g_i, g_i_exp);
-                        Mul(q_i, 1.0f, q_i_temp);
-                        MulTo(q_i_temp, g_i_exp);
+                            Data k_i_v_new;
+                            PermuteSelf(k_i, {0, 1, 3, 2});
+                            MatMul(k_i, v_new, k_i_v_new);
 
-                        MatMul(q_i_temp, last_recurrent_state, attn_inter);
-                        Data atv;
-                        MatMul(attn, v_new, atv);
-                        AddTo(atv, attn_inter);
-                        atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
-                        if (ci == 0) {
-                            Mul(atv, 1.0f, core_attn_out);
-                        } else {
-                            Mul(core_attn_out, 1.0f, core_attn_out_temp);
-                            Cat(core_attn_out_temp, atv, 3, core_attn_out);
+                            Data g_i_exp_last;
+                            g_i_exp_last.dims = {g_i_exp.dims[0], g_i_exp.dims[1], 1, g_i_exp.dims[3]};
+                            g_i_exp_last.strides = {g_i_exp.strides[0], g_i_exp.strides[1], g_i_exp.strides[2], g_i_exp.strides[3]};
+                            g_i_exp_last.FakeFrom(g_i_exp, (size_t)(g_i_exp.dims[2] - 1) * g_i_exp.strides[2] * g_i_exp.unitSize);
+                            MulTo(state, g_i_exp_last);
+                            AddTo(state, k_i_v_new);
                         }
+                    };
 
-                        g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[2]});
-                        Data g_i_last, g_i_last_repeat, g_i_l_temp;
-                        Split(g_i, -1, g_i.dims.back() - 1, g_i.dims.back(), g_i_last);
-                        Repeat(g_i_last, -1, g_i.dims.back(), g_i_last_repeat);
-                        Mul(g_i, -1.0f, g_i_l_temp);
-                        AddTo(g_i_l_temp, g_i_last_repeat);
-                        Exp(g_i_l_temp, g_i_l_temp);
-                        g_i_l_temp.Resize({g_i_l_temp.dims[0], g_i_l_temp.dims[1], g_i_l_temp.dims[2], 1});
-                        MulTo(k_i, g_i_l_temp);
-                        PermuteSelf(k_i, {0, 1, 3, 2});
+                    bool useFusedChunkPrefill = false;
+#ifdef USE_CUDA
+                    if (qq.dataDevice == DataDevice::CUDA &&
+                        pkk->dataDevice == DataDevice::CUDA &&
+                        vv.dataDevice == DataDevice::CUDA &&
+                        pgg->dataDevice == DataDevice::CUDA &&
+                        attn.dataDevice == DataDevice::CUDA &&
+                        k_cumdecay.dataDevice == DataDevice::CUDA &&
+                        last_recurrent_state.dataDevice == DataDevice::CUDA) {
+                        useFusedChunkPrefill = GetFastllmEnv().useFusedGdnPrefill;
+                    }
+#endif
 
-                        Data k_i_v_new;
-                        MatMul(k_i, v_new, k_i_v_new);
-
-                        Data g_i_exp_last;
-                        Split(g_i_exp, 2, g_i_exp.dims[2] - 1, g_i_exp.dims[2], g_i_exp_last);
-                        MulTo(last_recurrent_state, g_i_exp_last);
-                        AddTo(last_recurrent_state, k_i_v_new);
+                    if (useFusedChunkPrefill) {
+#ifdef USE_CUDA
+                        ChunkGatedDeltaRulePrefill(
+                            qq, *pkk, vv, *pgg, attn, k_cumdecay,
+                            last_recurrent_state, core_attn_out
+                        );
+#endif
+                    } else {
+                        PermuteSelf(qq, {2, 0, 1, 3, 4});
+                        PermuteSelf(*pkk, {2, 0, 1, 3, 4});
+                        PermuteSelf(vv, {2, 0, 1, 3, 4});
+                        PermuteSelf(attn, {2, 0, 1, 3, 4});
+                        PermuteSelf(k_cumdecay, {2, 0, 1, 3, 4});
+                        PermuteSelf(*pgg, {2, 0, 1, 3});
+                        runChunkPrefillReference(last_recurrent_state, core_attn_out);
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
-                    Split(core_attn_out, 2, 0, seq, core_attn_out_temp);
-                    PermuteSelf(core_attn_out_temp, {0, 2, 1, 3});
-                    Mul(core_attn_out_temp, 1.0f, core_attn_out);
+                    if (pad_size > 0) {
+                        Split(core_attn_out, 2, 0, seq, core_attn_out_temp);
+                        PermuteSelf(core_attn_out_temp, {0, 2, 1, 3});
+                        Mul(core_attn_out_temp, 1.0f, core_attn_out);
+                    } else {
+                        PermuteSelf(core_attn_out, {0, 2, 1, 3});
+                    }
                 }
 
                 {
@@ -613,6 +691,7 @@ namespace fastllm {
                         Data(), attenInput);
                 }
             }
+
             AddTo(hiddenStates, attenInput);
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);

@@ -9,6 +9,7 @@
 #include "fastllm.h"
 #include "utils/utils.h"
 
+#include <cstdlib>
 #include <random>
 #include <type_traits>
 #include <cuda_fp8.h>
@@ -168,7 +169,9 @@ CudaInfos *getCudaInfos() {
 }
 
 void DeviceSync() {
-    // cudaDeviceSynchronize();
+    if (fastllm::GetFastllmEnv().cudaSync) {
+        cudaDeviceSynchronize();
+    }
 }
 
 void ForceDeviceSync() {
@@ -2297,61 +2300,69 @@ __device__ __forceinline__ __nv_fp8_e4m3 FastllmCudaFloatToValue<__nv_fp8_e4m3>(
     return __nv_fp8_e4m3(value);
 }
 
-// CUDA kernel for the main transformation
 template<typename T>
-__global__ void TransferAttnKernel(T *data, int n, int m, int outer, int row_idx) {
-    int o = blockIdx.z;  // batch index
+__global__ void TransferAttnKernelFused(T *data, int n, int m, int outer) {
+    extern __shared__ float shared[];
+
+    int o = blockIdx.x;
     if (o >= outer) return;
-    
-    int j = threadIdx.x + blockIdx.x * blockDim.x;  // column index
-    if (j >= row_idx) return;  // 只处理前row_idx个元素
-    
-    T *batchData = data + o * n * m;
-    
-    // 保存原始的第row_idx行的值
-    float original_val = FastllmCudaValueToFloat(batchData[row_idx * m + j]);
-    
-    // 计算新值: original_val + sum(row[k] * matrix[k][j] for k in [0, row_idx))
-    float sum = original_val;
-    for (int k = 0; k < row_idx; k++) {
-        sum += FastllmCudaValueToFloat(batchData[row_idx * m + k]) *
-               FastllmCudaValueToFloat(batchData[k * m + j]);
+
+    T *batchData = data + (size_t)o * n * m;
+    float *matrix = shared;
+    float *row = shared + n * m;
+
+    for (int idx = threadIdx.x; idx < n * m; idx += blockDim.x) {
+        matrix[idx] = FastllmCudaValueToFloat(batchData[idx]);
     }
-    
-    // 更新值
-    batchData[row_idx * m + j] = FastllmCudaFloatToValue<T>(sum);
+    __syncthreads();
+
+    for (int i = 1; i < n; i++) {
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            row[j] = matrix[i * m + j];
+        }
+        __syncthreads();
+
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            float sum = row[j];
+            for (int k = 0; k < i; k++) {
+                sum += row[k] * matrix[k * m + j];
+            }
+            matrix[i * m + j] = sum;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = threadIdx.x; idx < n * m; idx += blockDim.x) {
+        int i = idx / m;
+        int j = idx % m;
+        float value = matrix[idx] + (i == j ? 1.0f : 0.0f);
+        batchData[idx] = FastllmCudaFloatToValue<T>(value);
+    }
 }
 
-// 使用共享内存的优化版本
 template<typename T>
-__global__ void TransferAttnKernelShared(T *data, int n, int m, int outer, int row_idx) {
+__global__ void TransferAttnKernelRow(T *data, int n, int m, int outer, int row_idx) {
     extern __shared__ float shared[];
-    
+
     int o = blockIdx.z;
     if (o >= outer) return;
-    
+
     int tid = threadIdx.x;
     int j = tid + blockIdx.x * blockDim.x;
-    
-    T *batchData = data + o * n * m;
-    float *row_i = shared;  // 存储第row_idx行的前row_idx个元素
-    
-    // 协作加载第row_idx行的前row_idx个元素到共享内存
+
+    T *batchData = data + (size_t)o * n * m;
+    float *row_i = shared;
+
     for (int idx = tid; idx < row_idx; idx += blockDim.x) {
         row_i[idx] = FastllmCudaValueToFloat(batchData[row_idx * m + idx]);
     }
     __syncthreads();
-    
+
     if (j < row_idx) {
-        // 使用共享内存中的原始值计算
         float sum = row_i[j];
-        
-        // 累加：注意这里row_i[k]是原始值，batchData[k * m + j]是可能已更新的值
         for (int k = 0; k < row_idx; k++) {
             sum += row_i[k] * FastllmCudaValueToFloat(batchData[k * m + j]);
         }
-        
-        // 写回结果
         batchData[row_idx * m + j] = FastllmCudaFloatToValue<T>(sum);
     }
 }
@@ -2379,44 +2390,55 @@ bool FastllmCudaTransferAttn(fastllm::Data &input) {
     int m = input.dims[dimsLen - 1]; 
     int outer = input.Count(0) / input.Count(dimsLen - 2);
 
-    // 逐行处理，从第1行开始（第0行不需要处理）
-    for (int i = 1; i < n; i++) {
-        // 每行只需要处理前i个元素
-        int elementsToProcess = i;
-        int threadsPerBlock = min(256, elementsToProcess);
-        int blocksPerGrid = (elementsToProcess + threadsPerBlock - 1) / threadsPerBlock;
-        
-        dim3 blocks(blocksPerGrid, 1, outer);
-        dim3 threads(threadsPerBlock, 1, 1);
-        
-        // 使用共享内存版本
-        int sharedMemSize = elementsToProcess * sizeof(float);
-        if (input.dataType == fastllm::DataType::FLOAT32) {
-            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-                (float*)inputData, n, m, outer, i);
-        } else if (input.dataType == fastllm::DataType::FLOAT16) {
-            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-                (half*)inputData, n, m, outer, i);
-        } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-                (__nv_bfloat16*)inputData, n, m, outer, i);
-        }
-        
-        // 必须同步，因为下一行的计算依赖于当前行的结果
-        cudaDeviceSynchronize();
-    }
+    bool useFusedTransferAttn = (n == m && n <= 64 && m <= 64) &&
+                                fastllm::GetFastllmEnv().useFusedTransferAttn;
 
-    // 添加单位矩阵
-    int totalDiag = outer * n;
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (totalDiag + threadsPerBlock - 1) / threadsPerBlock;
-    
-    if (input.dataType == fastllm::DataType::FLOAT32) {
-        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((float*)inputData, n, m, outer);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((half*)inputData, n, m, outer);
-    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((__nv_bfloat16*)inputData, n, m, outer);
+    if (useFusedTransferAttn) {
+        int threadsPerBlock = 64;
+        int sharedMemSize = (n * m + n) * sizeof(float);
+        if (input.dataType == fastllm::DataType::FLOAT32) {
+            TransferAttnKernelFused<<<outer, threadsPerBlock, sharedMemSize>>>(
+                (float*)inputData, n, m, outer);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            TransferAttnKernelFused<<<outer, threadsPerBlock, sharedMemSize>>>(
+                (half*)inputData, n, m, outer);
+        } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+            TransferAttnKernelFused<<<outer, threadsPerBlock, sharedMemSize>>>(
+                (__nv_bfloat16*)inputData, n, m, outer);
+        }
+    } else {
+        for (int i = 1; i < n; i++) {
+            int elementsToProcess = i;
+            int threadsPerBlock = min(256, elementsToProcess);
+            int blocksPerGrid = (elementsToProcess + threadsPerBlock - 1) / threadsPerBlock;
+
+            dim3 blocks(blocksPerGrid, 1, outer);
+            dim3 threads(threadsPerBlock, 1, 1);
+            int sharedMemSize = elementsToProcess * sizeof(float);
+
+            if (input.dataType == fastllm::DataType::FLOAT32) {
+                TransferAttnKernelRow<<<blocks, threads, sharedMemSize>>>(
+                    (float*)inputData, n, m, outer, i);
+            } else if (input.dataType == fastllm::DataType::FLOAT16) {
+                TransferAttnKernelRow<<<blocks, threads, sharedMemSize>>>(
+                    (half*)inputData, n, m, outer, i);
+            } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+                TransferAttnKernelRow<<<blocks, threads, sharedMemSize>>>(
+                    (__nv_bfloat16*)inputData, n, m, outer, i);
+            }
+            cudaDeviceSynchronize();
+        }
+
+        int totalDiag = outer * n;
+        int threadsPerBlock = 256;
+        int blocksPerGrid = (totalDiag + threadsPerBlock - 1) / threadsPerBlock;
+        if (input.dataType == fastllm::DataType::FLOAT32) {
+            AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((float*)inputData, n, m, outer);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((half*)inputData, n, m, outer);
+        } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+            AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((__nv_bfloat16*)inputData, n, m, outer);
+        }
     }
 
     DeviceSync();
@@ -2466,6 +2488,50 @@ bool FastllmCudaCumSumLastDim(fastllm::Data &input) {
     FastllmCudaFinishOutput(input, inputData);
     
     return true; // 添加返回值
+}
+
+template<typename T>
+__global__ void ApplyChunkDecayByLastLogGKernel(T *input, const T *g, int dim, int channels, int outer) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outer * dim * channels;
+
+    if (idx < total) {
+        int tokenIdx = (idx / channels) % dim;
+        int outerIdx = idx / (dim * channels);
+        float last = FastllmCudaValueToFloat(g[outerIdx * dim + dim - 1]);
+        float cur = FastllmCudaValueToFloat(g[outerIdx * dim + tokenIdx]);
+        float scale = expf(last - cur);
+        float value = FastllmCudaValueToFloat(input[idx]) * scale;
+        input[idx] = FastllmCudaFloatToValue<T>(value);
+    }
+}
+
+bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::Data &g) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *gData = FastllmCudaPrepareInput(g);
+
+    int dim = input.dims[input.dims.size() - 2];
+    int channels = input.dims.back();
+    int outer = g.Count(0) / dim;
+    int total = outer * dim * channels;
+    int blockSize = 256;
+    int gridSize = (total + blockSize - 1) / blockSize;
+
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        ApplyChunkDecayByLastLogGKernel<float><<<gridSize, blockSize>>>(
+            (float*)inputData, (float*)gData, dim, channels, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        ApplyChunkDecayByLastLogGKernel<half><<<gridSize, blockSize>>>(
+            (half*)inputData, (half*)gData, dim, channels, outer);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        ApplyChunkDecayByLastLogGKernel<__nv_bfloat16><<<gridSize, blockSize>>>(
+            (__nv_bfloat16*)inputData, (__nv_bfloat16*)gData, dim, channels, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishInput(g, gData);
+    FastllmCudaFinishOutput(input, inputData);
+    return true;
 }
 
 // CUDA核函数模板，支持float和half
@@ -4749,6 +4815,528 @@ void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm:
     
     // Synchronize if needed
     DeviceSync();
+}
+
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleBuildQScaledChunkKernel(
+    const T *q, const T *g, T *qScaled,
+    int chunks, int ci, int chunk_size, int kdim, size_t total) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        size_t inner = (size_t)chunk_size * kdim;
+        size_t bh = idx / inner;
+        size_t rem = idx % inner;
+        size_t t = rem / kdim;
+        size_t kd = rem % kdim;
+        size_t gIdx = ((bh * chunks + (size_t)ci) * chunk_size + t);
+        size_t qIdx = gIdx * kdim + kd;
+        qScaled[idx] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(q[qIdx]) * expf(FastllmCudaValueToFloat(g[gIdx])));
+    }
+}
+
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleBuildChunkScaleKernel(
+    const T *g, float *gScale, float *gLastExp,
+    int bhCount, int chunks, int chunk_size, int ci) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = bhCount * chunk_size;
+    if (idx < total) {
+        int bh = idx / chunk_size;
+        int t = idx % chunk_size;
+        int base = (bh * chunks + ci) * chunk_size;
+        float last = FastllmCudaValueToFloat(g[base + chunk_size - 1]);
+        gScale[idx] = expf(last - FastllmCudaValueToFloat(g[base + t]));
+        if (t == 0) {
+            gLastExp[bh] = expf(last);
+        }
+    }
+}
+
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleScaleStateKernel(
+    T *state, const float *gLastExp,
+    int stateSize, size_t total) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int bh = idx / stateSize;
+        state[idx] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(state[idx]) * gLastExp[bh]);
+    }
+}
+
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleBuildKScaledTransKernel(
+    const T *k, const float *gScale, T *kScaledTrans,
+    int chunks, int ci, int chunk_size, int kdim, size_t total) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        size_t inner = (size_t)kdim * chunk_size;
+        int bh = idx / inner;
+        int rem = idx % inner;
+        int kd = rem / chunk_size;
+        int t = rem % chunk_size;
+        size_t src = ((((size_t)bh * chunks + ci) * chunk_size + t) * kdim + kd);
+        kScaledTrans[idx] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(k[src]) * gScale[(size_t)bh * chunk_size + t]);
+    }
+}
+
+static void FastllmChunkGatedDeltaRuleBatchedMatMul(
+    const void *input0, const void *input1, void *output,
+    fastllm::DataType dataType,
+    int batch, int n, int m, int k,
+    long long stride0, long long stride1, long long strideOut,
+    float alpha, float beta) {
+    auto fastllmCublasHandle = getFastllmCublasHandle();
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+
+    if (dataType == fastllm::DataType::FLOAT32) {
+        status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                           CUBLAS_OP_N, CUBLAS_OP_N,
+                                           k, n, m, &alpha,
+                                           (const float*)input1, k, stride1,
+                                           (const float*)input0, m, stride0,
+                                           &beta,
+                                           (float*)output, k, strideOut, batch);
+    } else if (dataType == fastllm::DataType::FLOAT16) {
+        half hAlpha = __float2half(alpha);
+        half hBeta = __float2half(beta);
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                           CUBLAS_OP_N, CUBLAS_OP_N,
+                                           k, n, m, &hAlpha,
+                                           (const half*)input1, k, stride1,
+                                           (const half*)input0, m, stride0,
+                                           &hBeta,
+                                           (half*)output, k, strideOut, batch);
+    } else {
+        printf("Error: unsupported data type in FastllmChunkGatedDeltaRuleBatchedMatMul.\n");
+        throw("unsupported data type");
+    }
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("status = %d\n", (int)status);
+        printf("batch = %d, n = %d, m = %d, k = %d\n", batch, n, m, k);
+        printf("Error: cublas error in ChunkGatedDeltaRule batched matmul.\n");
+        throw("cublas error");
+    }
+}
+
+template <typename T, int BV, int BK>
+__global__ void FastllmChunkGatedDeltaRulePrefillHKernel(
+    const T *k, const T *v, const T *g, const T *k_cumdecay,
+    T *h_states, T *v_new_store, T *last_recurrent_state,
+    int batch, int heads, int chunks, int chunk_size, int kdim, int vdim) {
+    int vTile = blockIdx.x;
+    int bh = blockIdx.y;
+    int b = bh / heads, h = bh % heads;
+    int vStart = vTile * BV;
+    if (b >= batch || h >= heads || vStart >= vdim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    extern __shared__ float shared_mem[];
+    float *stateTile = shared_mem;                         // [kdim, BV]
+    float *vNewTile = stateTile + kdim * BV;              // [chunk_size, BV]
+    float *tempTile = vNewTile + chunk_size * BV;         // [chunk_size, BK]
+    float *gScale = tempTile + chunk_size * BK;           // [chunk_size]
+
+    const size_t chunkStrideK = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t headBaseK = ((size_t)b * heads + h) * chunks * chunkStrideK;
+    const size_t headBaseV = ((size_t)b * heads + h) * chunks * chunkStrideV;
+    const size_t headBaseG = ((size_t)b * heads + h) * chunks * chunkStrideG;
+    const size_t stateBase = ((size_t)b * heads + h) * kdim * vdim;
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        stateTile[idx] = (vcol < vdim) ? FastllmCudaValueToFloat(last_recurrent_state[stateBase + (size_t)kd * vdim + vcol]) : 0.0f;
+    }
+    __syncthreads();
+
+    for (int ci = 0; ci < chunks; ci++) {
+        const T *kChunk = k + (size_t)ci * chunkStrideK + headBaseK;
+        const T *vChunk = v + (size_t)ci * chunkStrideV + headBaseV;
+        const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
+        const T *kCumChunk = k_cumdecay + (size_t)ci * chunkStrideK + headBaseK;
+        T *hChunk = h_states + ((((size_t)b * heads + h) * chunks + ci) * kdim * vdim + vStart);
+        T *vNewChunk = v_new_store + ((((size_t)b * heads + h) * chunks + ci) * chunkStrideV + vStart);
+
+        for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+            int kd = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            if (vcol < vdim) {
+                hChunk[(size_t)kd * vdim + vo] = FastllmCudaFloatToValue<T>(stateTile[idx]);
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+            int t = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            vNewTile[idx] = (vcol < vdim) ? FastllmCudaValueToFloat(vChunk[t * vdim + vcol]) : 0.0f;
+        }
+        __syncthreads();
+
+        for (int ks = 0; ks < kdim; ks += BK) {
+            int curBK = min(BK, kdim - ks);
+            for (int idx = tid; idx < chunk_size * curBK; idx += blockDim.x) {
+                int t = idx / curBK;
+                int kk = idx % curBK;
+                tempTile[t * BK + kk] = FastllmCudaValueToFloat(kCumChunk[t * kdim + ks + kk]);
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+                int t = idx / BV;
+                int vo = idx % BV;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int kk = 0; kk < BK; kk++) {
+                    if (kk < curBK) {
+                        sum += tempTile[t * BK + kk] * stateTile[(ks + kk) * BV + vo];
+                    }
+                }
+                vNewTile[idx] -= sum;
+            }
+            __syncthreads();
+        }
+
+        float gLast = FastllmCudaValueToFloat(gChunk[chunk_size - 1]);
+        float gLastExp = expf(gLast);
+        for (int idx = tid; idx < chunk_size; idx += blockDim.x) {
+            gScale[idx] = expf(gLast - FastllmCudaValueToFloat(gChunk[idx]));
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+            int t = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            if (vcol < vdim) {
+                vNewChunk[t * vdim + vo] = FastllmCudaFloatToValue<T>(vNewTile[idx]);
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+            stateTile[idx] *= gLastExp;
+        }
+        __syncthreads();
+
+        for (int ks = 0; ks < kdim; ks += BK) {
+            int curBK = min(BK, kdim - ks);
+            for (int idx = tid; idx < chunk_size * curBK; idx += blockDim.x) {
+                int t = idx / curBK;
+                int kk = idx % curBK;
+                tempTile[t * BK + kk] = FastllmCudaValueToFloat(kChunk[t * kdim + ks + kk]) * gScale[t];
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < curBK * BV; idx += blockDim.x) {
+                int kk = idx / BV;
+                int vo = idx % BV;
+                float update = 0.0f;
+                #pragma unroll
+                for (int t = 0; t < chunk_size; t++) {
+                    update += tempTile[t * BK + kk] * vNewTile[t * BV + vo];
+                }
+                stateTile[(ks + kk) * BV + vo] += update;
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        if (vcol < vdim) {
+            last_recurrent_state[stateBase + (size_t)kd * vdim + vcol] = FastllmCudaFloatToValue<T>(stateTile[idx]);
+        }
+    }
+}
+
+template <typename T, int BV>
+__global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
+    const T *q, const T *g, const T *attn,
+    const T *h_states, const T *v_new_store, T *core_attn_out,
+    int batch, int heads, int chunks, int chunk_size, int kdim, int vdim) {
+    int vTile = blockIdx.x;
+    int ci = blockIdx.y;
+    int bh = blockIdx.z;
+    int b = bh / heads, h = bh % heads;
+    int vStart = vTile * BV;
+    if (b >= batch || h >= heads || ci >= chunks || vStart >= vdim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int warpCount = (blockDim.x + 31) >> 5;
+    const unsigned int warpMask = 0xffffffffu;
+    extern __shared__ float shared_mem[];
+    float *hTile = shared_mem;                            // [kdim, BV]
+    float *vNewTile = hTile + kdim * BV;                 // [chunk_size, BV]
+
+    const size_t chunkStrideQ = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t chunkStrideAttn = (size_t)chunk_size * chunk_size;
+    const size_t headBaseQ = ((size_t)b * heads + h) * chunks * chunkStrideQ;
+    const size_t headBaseV = ((size_t)b * heads + h) * chunks * chunkStrideV;
+    const size_t headBaseG = ((size_t)b * heads + h) * chunks * chunkStrideG;
+    const size_t headBaseAttn = ((size_t)b * heads + h) * chunks * chunkStrideAttn;
+    const T *qChunk = q + (size_t)ci * chunkStrideQ + headBaseQ;
+    const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
+    const T *attnChunk = attn + (size_t)ci * chunkStrideAttn + headBaseAttn;
+    const T *hChunk = h_states + ((((size_t)b * heads + h) * chunks + ci) * kdim * vdim + vStart);
+    const T *vNewChunk = v_new_store + ((((size_t)b * heads + h) * chunks + ci) * chunkStrideV + vStart);
+    T *outChunk = core_attn_out + ((((size_t)b * heads + h) * chunks + ci) * chunk_size * vdim + vStart);
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        hTile[idx] = (vcol < vdim) ? FastllmCudaValueToFloat(hChunk[(size_t)kd * vdim + vo]) : 0.0f;
+    }
+
+    for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+        int t = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        vNewTile[idx] = (vcol < vdim) ? FastllmCudaValueToFloat(vNewChunk[t * vdim + vo]) : 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = warp; t < chunk_size; t += warpCount) {
+        int vcol = vStart + lane;
+        if (vcol < vdim) {
+            float gExp = 0.0f;
+            if (lane == 0) {
+                gExp = expf(FastllmCudaValueToFloat(gChunk[t]));
+            }
+            gExp = __shfl_sync(warpMask, gExp, 0);
+
+            float sum = 0.0f;
+            for (int kd = 0; kd < kdim; kd++) {
+                float qValue = 0.0f;
+                if (lane == 0) {
+                    qValue = FastllmCudaValueToFloat(qChunk[t * kdim + kd]);
+                }
+                qValue = __shfl_sync(warpMask, qValue, 0);
+                sum += qValue * hTile[(size_t)kd * BV + lane];
+            }
+            sum *= gExp;
+
+            const T *attnRow = attnChunk + (size_t)t * chunk_size;
+            for (int j = 0; j < chunk_size; j++) {
+                float attnValue = 0.0f;
+                if (lane == 0) {
+                    attnValue = FastllmCudaValueToFloat(attnRow[j]);
+                }
+                attnValue = __shfl_sync(warpMask, attnValue, 0);
+                sum += attnValue * vNewTile[j * BV + lane];
+            }
+            outChunk[t * vdim + lane] = FastllmCudaFloatToValue<T>(sum);
+        }
+    }
+}
+
+void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out) {
+    int batch = q.dims[0];
+    int heads = q.dims[1];
+    int chunks = q.dims[2];
+    int chunk_size = q.dims[3];
+    int kdim = q.dims[4];
+    int vdim = v.dims[4];
+
+    core_attn_out.dataType = v.dataType;
+    core_attn_out.dataDevice = v.dataDevice;
+    core_attn_out.dataDeviceIds = v.dataDeviceIds;
+    core_attn_out.Resize({batch, heads, chunks, chunk_size, vdim});
+    core_attn_out.Allocate();
+
+    size_t unitBytes = ((size_t)v.unitSize + v.unitSizeDiv - 1) / v.unitSizeDiv;
+    long long bhCount = (long long)batch * heads;
+    long long stateStride = (long long)kdim * vdim;
+    long long qChunkStride = (long long)chunk_size * kdim;
+    long long vChunkStride = (long long)chunk_size * vdim;
+    long long attnChunkStride = (long long)chunk_size * chunk_size;
+    bool useBatchedGemm = q.dataType == fastllm::DataType::FLOAT32 ||
+                          q.dataType == fastllm::DataType::FLOAT16;
+
+    size_t hElems = (size_t)batch * heads * chunks * kdim * vdim;
+    size_t vNewElems = useBatchedGemm ? (size_t)bhCount * vChunkStride
+                                      : (size_t)batch * heads * chunks * chunk_size * vdim;
+    void *hData = useBatchedGemm ? nullptr : FastllmCudaMalloc(hElems * unitBytes);
+    void *vNewData = FastllmCudaMalloc(vNewElems * unitBytes);
+
+    void *qData = FastllmCudaPrepareInput(q);
+    void *kData = FastllmCudaPrepareInput(k);
+    void *vData = FastllmCudaPrepareInput(v);
+    void *gData = FastllmCudaPrepareInput(g);
+    void *attnData = FastllmCudaPrepareInput(attn);
+    void *kCumData = FastllmCudaPrepareInput(k_cumdecay);
+    void *stateData = FastllmCudaPrepareInput(last_recurrent_state);
+    void *outData = FastllmCudaPrepareOutput(core_attn_out);
+    void *qScaledData = nullptr;
+    void *kScaledTransData = nullptr;
+    float *gScaleData = nullptr;
+    float *gLastExpData = nullptr;
+
+    if (useBatchedGemm) {
+        size_t qScaledElems = (size_t)bhCount * qChunkStride;
+        size_t stateElems = (size_t)bhCount * stateStride;
+        size_t kScaledTransElems = (size_t)bhCount * kdim * chunk_size;
+        qScaledData = FastllmCudaMalloc(qScaledElems * unitBytes);
+        kScaledTransData = FastllmCudaMalloc(kScaledTransElems * unitBytes);
+        gScaleData = (float*)FastllmCudaMalloc((size_t)bhCount * chunk_size * sizeof(float));
+        gLastExpData = (float*)FastllmCudaMalloc((size_t)bhCount * sizeof(float));
+
+        const int threads = 256;
+        int qScaleBlocks = (int)((qScaledElems + threads - 1) / threads);
+        int chunkScaleBlocks = (int)(((size_t)bhCount * chunk_size + threads - 1) / threads);
+        int stateScaleBlocks = (int)((stateElems + threads - 1) / threads);
+        int kScaleBlocks = (int)((kScaledTransElems + threads - 1) / threads);
+        long long outStride = (long long)chunks * vChunkStride;
+        for (int ci = 0; ci < chunks; ci++) {
+            uint8_t *kCumSlice = (uint8_t*)kCumData + (size_t)ci * qChunkStride * unitBytes;
+            uint8_t *vSlice = (uint8_t*)vData + (size_t)ci * vChunkStride * unitBytes;
+            uint8_t *attnSlice = (uint8_t*)attnData + (size_t)ci * attnChunkStride * unitBytes;
+            uint8_t *outSlice = (uint8_t*)outData + (size_t)ci * vChunkStride * unitBytes;
+
+            if (q.dataType == fastllm::DataType::FLOAT32) {
+                FastllmChunkGatedDeltaRuleBuildQScaledChunkKernel<float><<<qScaleBlocks, threads>>>(
+                    (float*)qData, (float*)gData, (float*)qScaledData,
+                    chunks, ci, chunk_size, kdim, qScaledElems);
+            } else {
+                FastllmChunkGatedDeltaRuleBuildQScaledChunkKernel<half><<<qScaleBlocks, threads>>>(
+                    (half*)qData, (half*)gData, (half*)qScaledData,
+                    chunks, ci, chunk_size, kdim, qScaledElems);
+            }
+
+            cudaError_t cudaState = cudaMemcpy2DAsync(vNewData, (size_t)vChunkStride * unitBytes,
+                                                      vSlice, (size_t)chunks * vChunkStride * unitBytes,
+                                                      (size_t)vChunkStride * unitBytes, bhCount,
+                                                      cudaMemcpyDeviceToDevice, 0);
+            checkCudaErrors("Error: CUDA error when gathering chunk v data!", cudaState);
+
+            FastllmChunkGatedDeltaRuleBatchedMatMul(
+                kCumSlice, stateData, vNewData, q.dataType,
+                (int)bhCount, chunk_size, kdim, vdim,
+                (long long)chunks * qChunkStride, stateStride, vChunkStride,
+                -1.0f, 1.0f);
+
+            FastllmChunkGatedDeltaRuleBatchedMatMul(
+                qScaledData, stateData, outSlice, q.dataType,
+                (int)bhCount, chunk_size, kdim, vdim,
+                qChunkStride, stateStride, outStride,
+                1.0f, 0.0f);
+
+            FastllmChunkGatedDeltaRuleBatchedMatMul(
+                attnSlice, vNewData, outSlice, q.dataType,
+                (int)bhCount, chunk_size, chunk_size, vdim,
+                (long long)chunks * attnChunkStride, vChunkStride, outStride,
+                1.0f, 1.0f);
+
+            if (q.dataType == fastllm::DataType::FLOAT32) {
+                FastllmChunkGatedDeltaRuleBuildChunkScaleKernel<float><<<chunkScaleBlocks, threads>>>(
+                    (float*)gData, gScaleData, gLastExpData, (int)bhCount, chunks, chunk_size, ci);
+                FastllmChunkGatedDeltaRuleScaleStateKernel<float><<<stateScaleBlocks, threads>>>(
+                    (float*)stateData, gLastExpData, (int)stateStride, stateElems);
+                FastllmChunkGatedDeltaRuleBuildKScaledTransKernel<float><<<kScaleBlocks, threads>>>(
+                    (float*)kData, gScaleData, (float*)kScaledTransData,
+                    chunks, ci, chunk_size, kdim, kScaledTransElems);
+            } else {
+                FastllmChunkGatedDeltaRuleBuildChunkScaleKernel<half><<<chunkScaleBlocks, threads>>>(
+                    (half*)gData, gScaleData, gLastExpData, (int)bhCount, chunks, chunk_size, ci);
+                FastllmChunkGatedDeltaRuleScaleStateKernel<half><<<stateScaleBlocks, threads>>>(
+                    (half*)stateData, gLastExpData, (int)stateStride, stateElems);
+                FastllmChunkGatedDeltaRuleBuildKScaledTransKernel<half><<<kScaleBlocks, threads>>>(
+                    (half*)kData, gScaleData, (half*)kScaledTransData,
+                    chunks, ci, chunk_size, kdim, kScaledTransElems);
+            }
+
+            FastllmChunkGatedDeltaRuleBatchedMatMul(
+                kScaledTransData, vNewData, stateData, q.dataType,
+                (int)bhCount, kdim, chunk_size, vdim,
+                (long long)kdim * chunk_size, vChunkStride, stateStride,
+                1.0f, 1.0f);
+        }
+    } else {
+        const int BVHSmall = 16;
+        const int BVHLarge = 32;
+        const int BVO = 32;
+        const int BKHSmall = 32;
+        const int BKHLarge = 64;
+        const size_t maxDynamicSharedMem = 48 * 1024;
+        bool useSmallBVH = vdim <= 64;
+        int bvh = useSmallBVH ? BVHSmall : BVHLarge;
+        size_t sharedMemSizeHSmallBK = (size_t)(kdim * bvh + chunk_size * bvh + chunk_size * BKHSmall + chunk_size) * sizeof(float);
+        size_t sharedMemSizeHLargeBK = (size_t)(kdim * bvh + chunk_size * bvh + chunk_size * BKHLarge + chunk_size) * sizeof(float);
+        bool useLargeBKH = chunk_size == 64 && sharedMemSizeHLargeBK <= maxDynamicSharedMem;
+        dim3 gridH(useSmallBVH ? (vdim + BVHSmall - 1) / BVHSmall : (vdim + BVHLarge - 1) / BVHLarge, batch * heads);
+        dim3 gridO((vdim + BVO - 1) / BVO, chunks, batch * heads);
+        int threadsPerBlockH = 256;
+        int threadsPerBlockO = chunk_size >= 64 ? 256 : 128;
+        size_t sharedMemSizeH = useLargeBKH ? sharedMemSizeHLargeBK : sharedMemSizeHSmallBK;
+        size_t sharedMemSizeO = (size_t)(kdim * BVO + chunk_size * BVO) * sizeof(float);
+
+        if (useSmallBVH) {
+            if (useLargeBKH) {
+                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHSmall, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            } else {
+                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHSmall, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            }
+        } else {
+            if (useLargeBKH) {
+                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            } else {
+                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            }
+        }
+        FastllmChunkGatedDeltaRulePrefillOKernel<__nv_bfloat16, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
+            (__nv_bfloat16*)qData, (__nv_bfloat16*)gData, (__nv_bfloat16*)attnData,
+            (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)outData,
+            batch, heads, chunks, chunk_size, kdim, vdim);
+    }
+
+    FastllmCudaFinishInput(q, qData);
+    FastllmCudaFinishInput(k, kData);
+    FastllmCudaFinishInput(v, vData);
+    FastllmCudaFinishInput(g, gData);
+    FastllmCudaFinishInput(attn, attnData);
+    FastllmCudaFinishInput(k_cumdecay, kCumData);
+    FastllmCudaFinishInput(last_recurrent_state, stateData);
+    FastllmCudaFinishOutput(core_attn_out, outData);
+    if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
+    if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
+    if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
+    if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
+    if (hData != nullptr) FastllmCudaFree(hData);
+    if (vNewData != nullptr) FastllmCudaFree(vNewData);
 }
 
 void FastllmPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex) {
