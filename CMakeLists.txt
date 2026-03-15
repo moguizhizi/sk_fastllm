@@ -1,3 +1,16 @@
+
+# ------------------ 新增：命令行宏控制 ------------------
+if(NOT DEFINED ENABLE_VLLM_KERNEL)
+    set(ENABLE_VLLM_KERNEL OFF)
+endif()
+if(ENABLE_VLLM_KERNEL)
+    add_compile_definitions(ENABLE_VLLM_KERNEL)
+    message(STATUS "ENABLE_VLLM_KERNEL macro enabled")
+else()
+    message(STATUS "ENABLE_VLLM_KERNEL macro disabled")
+endif()
+# ----------------------------------------------------------
+
 cmake_minimum_required(VERSION 3.5)
 
 project(fastllm LANGUAGES CXX)
