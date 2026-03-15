@@ -44,11 +44,24 @@ __device__ __forceinline__ void st256(u32x8_t &val, u32x8_t *ptr);
 
 template <typename packed_t>
 __device__ __forceinline__ packed_t packed_mul(const packed_t &x, const packed_t &y);
+
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &), bool act_first>
 __device__ __forceinline__ scalar_t compute(const scalar_t &x, const scalar_t &y);
 
 template <typename packed_t, packed_t (*PACKED_ACT_FN)(const packed_t &), bool act_first>
 __device__ __forceinline__ packed_t packed_compute(const packed_t &x, const packed_t &y);
+
+template <typename T>
+__device__ __forceinline__ T silu_kernel(const T &x);
+
+template <typename packed_t>
+__device__ __forceinline__ packed_t packed_silu_kernel(const packed_t &val);
+
+template <typename packed_t>
+__device__ __forceinline__ float2 cast_to_float2(const packed_t& val);
+
+template <typename packed_t>
+__device__ __forceinline__ packed_t cast_to_packed(const float2& val);
 
 // Activation and gating kernel template.
 template <typename scalar_t, typename packed_t, scalar_t (*ACT_FN)(const scalar_t &), packed_t (*PACKED_ACT_FN)(const packed_t &),
