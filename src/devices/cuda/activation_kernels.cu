@@ -62,6 +62,44 @@ __device__ __forceinline__ packed_t packed_compute(const packed_t &x, const pack
     return act_first ? packed_mul(PACKED_ACT_FN(x), y) : packed_mul(x, PACKED_ACT_FN(y));
 }
 
+template <typename T>
+__device__ __forceinline__ T silu_kernel(const T &x) {
+    // x * sigmoid(x)
+    return (T)(((float)x) / (1.0f + expf((float)-x)));
+}
+
+template <typename packed_t>
+__device__ __forceinline__ packed_t packed_silu_kernel(const packed_t &val) {
+    // x * sigmoid(x)
+    float2 fval = cast_to_float2(val);
+    fval.x = fval.x / (1.0f + expf(-fval.x));
+    fval.y = fval.y / (1.0f + expf(-fval.y));
+    return cast_to_packed<packed_t>(fval);
+}
+
+template <typename packed_t>
+__device__ __forceinline__ float2 cast_to_float2(const packed_t& val) {
+  if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+    return __bfloat1622float2(val);
+  } else if constexpr (std::is_same_v<packed_t, __half2>) {
+    return __half22float2(val);
+  } else if constexpr (std::is_same_v<packed_t, float2>) {
+    return float2(val);
+  }
+}
+
+template <typename packed_t>
+__device__ __forceinline__ packed_t cast_to_packed(const float2& val) {
+  if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+    return __float22bfloat162_rn(val);
+  } else if constexpr (std::is_same_v<packed_t, __half2>) {
+    return __float22half2_rn(val);
+  } else if constexpr (std::is_same_v<packed_t, float2>) {
+    return float2(val);
+  }
+}
+
+
 // Activation and gating kernel template.
 template <typename scalar_t, typename packed_t, scalar_t (*ACT_FN)(const scalar_t &), packed_t (*PACKED_ACT_FN)(const packed_t &),
     bool act_first, bool use_vec, bool use_256b>
