@@ -173,3 +173,24 @@ bool use_vec(uint32_t num_tokens, uint32_t elementSize, uint32_t num_elements) {
 
     return use_vec;
 }
+
+bool use_256b(uint32_t num_tokens){
+  int device = -1;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        printf("cudaGetDevice failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+
+    cudaDeviceProp prop;
+    auto error = cudaGetDeviceProperties(&prop, device);
+    if (error != cudaSuccess) {
+        printf("cudaGetDeviceProperties returned %d\n-> %s\n", (int)error, cudaGetErrorString(error));
+        return false;
+    }
+
+    int cc_major = prop.major;
+
+    return (num_tokens > 128) && (cc_major>=10);
+
+}
