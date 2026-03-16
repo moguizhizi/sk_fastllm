@@ -419,3 +419,44 @@ bool mul_and_silu(const fastllm::Data &input, fastllm::Data &output) // [..., 2 
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
 }
+
+bool gelu_and_mul(const fastllm::Data &input, fastllm::Data &output) {
+    int input_len = input.Count(0);
+    int output_len = output.Count(0);
+
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];
+    int elementSize = input.unitSize;
+    int output_num_elements = mid;
+
+    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements);
+    bool use_256b_flag = use_256b(num_tokens);
+
+    dim3 grid(num_tokens);
+    dim3 block(vec_config.block_size);
+
+    if (vec_config.use_vec) {
+        if (use_256b_flag) {
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_kernel, packed_gelu_kernel, {
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, true>
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
+            });
+        } else {
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_kernel, packed_gelu_kernel, {
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, false>
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
+            });
+        }
+    } else {
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_kernel, packed_gelu_kernel, {
+            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, false, false>
+                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
+        });
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
