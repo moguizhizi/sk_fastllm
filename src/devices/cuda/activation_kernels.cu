@@ -1,14 +1,90 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 
 #include "activation_kernels.cuh"
+#include <cstdio>
+#include <fastllm-cuda.cuh>
 
 #ifndef USE_ROCM
 #    define FASTLLM_LDG(arg) __ldg(arg)
 #else
 #    define VLLM_LDG(arg) *(arg)
 #endif
+
+#define LAUNCH_KERNEL(...) __VA_ARGS__
+
+#define FASTLLM_DISPATCH_FLOAT_TYPES(TYPE, ACT_FN, PACKED_ACT_FN, BODY)                        \
+    switch (TYPE) {                                                                            \
+        case fastllm::DataType::FLOAT32: {                                                     \
+            using scalar_t = float;                                                            \
+            using packed_t = float2;                                                           \
+            constexpr scalar_t (*act_fn)(const scalar_t &) = ACT_FN<float>;                    \
+            constexpr packed_t (*packed_fn)(const packed_t &) = PACKED_ACT_FN<float2>;         \
+            BODY;                                                                              \
+            break;                                                                             \
+        }                                                                                      \
+        case fastllm::DataType::FLOAT16: {                                                     \
+            using scalar_t = half;                                                             \
+            using packed_t = half2;                                                            \
+            constexpr scalar_t (*act_fn)(const scalar_t &) = ACT_FN<half>;                     \
+            constexpr packed_t (*packed_fn)(const packed_t &) = PACKED_ACT_FN<half2>;          \
+            BODY;                                                                              \
+            break;                                                                             \
+        }                                                                                      \
+        case fastllm::DataType::BFLOAT16: {                                                    \
+            using scalar_t = __nv_bfloat16;                                                    \
+            using packed_t = __nv_bfloat162;                                                   \
+            constexpr scalar_t (*act_fn)(const scalar_t &) = ACT_FN<__nv_bfloat16>;            \
+            constexpr packed_t (*packed_fn)(const packed_t &) = PACKED_ACT_FN<__nv_bfloat162>; \
+            BODY;                                                                              \
+            break;                                                                             \
+        }                                                                                      \
+    }
+
+struct VecConfig {
+    bool use_vec;
+    int vec_size;
+    int block_size;
+};
+
+struct alignas(32) u32x8_t {
+    uint32_t u0, u1, u2, u3, u4, u5, u6, u7;
+};
+
+template <typename T>
+struct PackedTraits;
+
+template <>
+struct PackedTraits<__nv_bfloat16> {
+    using packed_t = __nv_bfloat162;
+};
+
+template <>
+struct PackedTraits<half> {
+    using packed_t = __half2;
+};
+
+template <>
+struct PackedTraits<float> {
+    using packed_t = float2;
+};
+
+template <bool support_256>
+struct VecTraits;
+
+template <>
+struct VecTraits<true> {
+    static constexpr int ARCH_MAX_VEC_SIZE = 32;
+    using vec_t = u32x8_t;
+};
+
+template <>
+struct VecTraits<false> {
+    static constexpr int ARCH_MAX_VEC_SIZE = 16;
+    using vec_t = int4;
+};
 
 __device__ __forceinline__ void ld256(u32x8_t &val, const u32x8_t *ptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && defined(CUDA_VERSION) && CUDA_VERSION >= 12090
@@ -62,6 +138,17 @@ __device__ __forceinline__ packed_t packed_compute(const packed_t &x, const pack
     return act_first ? packed_mul(PACKED_ACT_FN(x), y) : packed_mul(x, PACKED_ACT_FN(y));
 }
 
+template <typename packed_t>
+__device__ __forceinline__ packed_t cast_to_packed(const float2 &val) {
+    if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+        return __float22bfloat162_rn(val);
+    } else if constexpr (std::is_same_v<packed_t, __half2>) {
+        return __float22half2_rn(val);
+    } else if constexpr (std::is_same_v<packed_t, float2>) {
+        return float2(val);
+    }
+}
+
 template <typename T>
 __device__ __forceinline__ T silu_kernel(const T &x) {
     // x * sigmoid(x)
@@ -78,27 +165,15 @@ __device__ __forceinline__ packed_t packed_silu_kernel(const packed_t &val) {
 }
 
 template <typename packed_t>
-__device__ __forceinline__ float2 cast_to_float2(const packed_t& val) {
-  if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
-    return __bfloat1622float2(val);
-  } else if constexpr (std::is_same_v<packed_t, __half2>) {
-    return __half22float2(val);
-  } else if constexpr (std::is_same_v<packed_t, float2>) {
-    return float2(val);
-  }
+__device__ __forceinline__ float2 cast_to_float2(const packed_t &val) {
+    if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+        return __bfloat1622float2(val);
+    } else if constexpr (std::is_same_v<packed_t, __half2>) {
+        return __half22float2(val);
+    } else if constexpr (std::is_same_v<packed_t, float2>) {
+        return float2(val);
+    }
 }
-
-template <typename packed_t>
-__device__ __forceinline__ packed_t cast_to_packed(const float2& val) {
-  if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
-    return __float22bfloat162_rn(val);
-  } else if constexpr (std::is_same_v<packed_t, __half2>) {
-    return __float22half2_rn(val);
-  } else if constexpr (std::is_same_v<packed_t, float2>) {
-    return float2(val);
-  }
-}
-
 
 // Activation and gating kernel template.
 template <typename scalar_t, typename packed_t, scalar_t (*ACT_FN)(const scalar_t &), packed_t (*PACKED_ACT_FN)(const packed_t &),
@@ -152,31 +227,39 @@ __global__ void act_and_mul_kernel(scalar_t *__restrict__ out, // [..., d]
     }
 }
 
-bool use_vec(uint32_t num_tokens, uint32_t elementSize, uint32_t num_elements) {
-    if (elementSize == 0) {
-        return false;
-    }
+VecConfig get_vec_config(uint32_t num_tokens, uint32_t elementSize, uint32_t num_elements) {
+    VecConfig cfg{};
 
     int device = -1;
     cudaError_t err = cudaGetDevice(&device);
     if (err != cudaSuccess) {
         printf("cudaGetDevice failed: %s\n", cudaGetErrorString(err));
-        return false;
+        return cfg;
     }
 
     cudaDeviceProp prop;
-    auto error = cudaGetDeviceProperties(&prop, device);
-    if (error != cudaSuccess) {
-        printf("cudaGetDeviceProperties returned %d\n-> %s\n", (int)error, cudaGetErrorString(error));
-        return false;
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        printf("cudaGetDeviceProperties failed: %s\n", cudaGetErrorString(err));
+        return cfg;
     }
 
     int cc_major = prop.major;
-    int support_vec = (cc_major >= 10 && num_tokens > 128) ? 32 : 16;
-    int vec_size = support_vec / elementSize;
-    bool use_vec = (num_elements % vec_size == 0);
 
-    return use_vec;
+    int support_vec = (cc_major >= 10 && num_tokens > 128) ? 32 : 16;
+
+    cfg.vec_size = support_vec / elementSize;
+
+    cfg.use_vec = (num_elements % cfg.vec_size == 0);
+
+    if (cfg.use_vec) {
+        cfg.block_size = std::min((int)(num_elements / cfg.vec_size), 1024);
+    } else {
+        cfg.vec_size = 1;
+        cfg.block_size = std::min((int)num_elements, 1024);
+    }
+
+    return cfg;
 }
 
 bool use_256b(uint32_t num_tokens) {
@@ -197,4 +280,46 @@ bool use_256b(uint32_t num_tokens) {
     int cc_major = prop.major;
 
     return (num_tokens > 128) && (cc_major >= 10);
+}
+
+bool silu_and_mul(const fastllm::Data &input, fastllm::Data &output){
+    int input_len = input.Count(0);
+    int output_len = output.Count(0);
+
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];
+    int elementSize = input.unitSize;
+    int output_num_elements = mid;
+
+    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements);
+    bool use_256b_flag = use_256b(num_tokens);
+
+    dim3 grid(num_tokens);
+    dim3 block(vec_config.block_size);
+
+    if (vec_config.use_vec) {
+        if (use_256b_flag) {
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, true>
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
+            });
+        } else {
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, false>
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
+            });
+        }
+    } else {
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
+            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, false, false>
+                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
+        });
+    }
+    
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
 }
