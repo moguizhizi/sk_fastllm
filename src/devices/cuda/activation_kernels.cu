@@ -177,25 +177,57 @@ __device__ __forceinline__ packed_t packed_silu_kernel(const packed_t &val) {
 }
 
 template <typename T>
-__device__ __forceinline__ T gelu_kernel(const T& x) {
-  // Equivalent to PyTorch GELU with 'none' approximation.
-  // Refer to:
-  // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
-  const float f = (float)x;
-  constexpr float ALPHA = M_SQRT1_2;
-  return (T)(f * 0.5f * (1.0f + ::erf(f * ALPHA)));
+__device__ __forceinline__ T gelu_kernel(const T &x) {
+    // Equivalent to PyTorch GELU with 'none' approximation.
+    // Refer to:
+    // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
+    const float f = (float)x;
+    constexpr float ALPHA = M_SQRT1_2;
+    return (T)(f * 0.5f * (1.0f + ::erf(f * ALPHA)));
 }
 
 template <typename packed_t>
-__device__ __forceinline__ packed_t packed_gelu_kernel(const packed_t& val) {
-  // Equivalent to PyTorch GELU with 'none' approximation.
-  // Refer to:
-  // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
-  constexpr float ALPHA = M_SQRT1_2;
-  float2 fval = cast_to_float2(val);
-  fval.x = fval.x * 0.5f * (1.0f + ::erf(fval.x * ALPHA));
-  fval.y = fval.y * 0.5f * (1.0f + ::erf(fval.y * ALPHA));
-  return cast_to_packed<packed_t>(fval);
+__device__ __forceinline__ packed_t packed_gelu_kernel(const packed_t &val) {
+    // Equivalent to PyTorch GELU with 'none' approximation.
+    // Refer to:
+    // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
+    constexpr float ALPHA = M_SQRT1_2;
+    float2 fval = cast_to_float2(val);
+    fval.x = fval.x * 0.5f * (1.0f + ::erf(fval.x * ALPHA));
+    fval.y = fval.y * 0.5f * (1.0f + ::erf(fval.y * ALPHA));
+    return cast_to_packed<packed_t>(fval);
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_tanh_kernel(const T &x) {
+    // Equivalent to PyTorch GELU with 'tanh' approximation.
+    // Refer to:
+    // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L25-L30
+    const float f = (float)x;
+    constexpr float BETA = M_SQRT2 * M_2_SQRTPI * 0.5f;
+    constexpr float KAPPA = 0.044715;
+    float x_cube = f * f * f;
+    float inner = BETA * (f + KAPPA * x_cube);
+    return (T)(0.5f * f * (1.0f + ::tanhf(inner)));
+}
+
+template <typename packed_t>
+__device__ __forceinline__ packed_t packed_gelu_tanh_kernel(const packed_t &val) {
+    // Equivalent to PyTorch GELU with 'tanh' approximation.
+    // Refer to:
+    // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L25-L30
+    float2 fval = cast_to_float2(val);
+    constexpr float BETA = M_SQRT2 * M_2_SQRTPI * 0.5f;
+    constexpr float KAPPA = 0.044715;
+
+    float x_cube = fval.x * fval.x * fval.x;
+    float inner = BETA * (fval.x + KAPPA * x_cube);
+    fval.x = 0.5f * fval.x * (1.0f + ::tanhf(inner));
+
+    x_cube = fval.y * fval.y * fval.y;
+    inner = BETA * (fval.y + KAPPA * x_cube);
+    fval.y = 0.5f * fval.y * (1.0f + ::tanhf(inner));
+    return cast_to_packed<packed_t>(fval);
 }
 
 // Activation and gating kernel template.
