@@ -150,6 +150,17 @@ __device__ __forceinline__ packed_t cast_to_packed(const float2 &val) {
     }
 }
 
+template <typename packed_t>
+__device__ __forceinline__ float2 cast_to_float2(const packed_t &val) {
+    if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+        return __bfloat1622float2(val);
+    } else if constexpr (std::is_same_v<packed_t, __half2>) {
+        return __half22float2(val);
+    } else if constexpr (std::is_same_v<packed_t, float2>) {
+        return float2(val);
+    }
+}
+
 template <typename T>
 __device__ __forceinline__ T silu_kernel(const T &x) {
     // x * sigmoid(x)
@@ -165,15 +176,26 @@ __device__ __forceinline__ packed_t packed_silu_kernel(const packed_t &val) {
     return cast_to_packed<packed_t>(fval);
 }
 
+template <typename T>
+__device__ __forceinline__ T gelu_kernel(const T& x) {
+  // Equivalent to PyTorch GELU with 'none' approximation.
+  // Refer to:
+  // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
+  const float f = (float)x;
+  constexpr float ALPHA = M_SQRT1_2;
+  return (T)(f * 0.5f * (1.0f + ::erf(f * ALPHA)));
+}
+
 template <typename packed_t>
-__device__ __forceinline__ float2 cast_to_float2(const packed_t &val) {
-    if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
-        return __bfloat1622float2(val);
-    } else if constexpr (std::is_same_v<packed_t, __half2>) {
-        return __half22float2(val);
-    } else if constexpr (std::is_same_v<packed_t, float2>) {
-        return float2(val);
-    }
+__device__ __forceinline__ packed_t packed_gelu_kernel(const packed_t& val) {
+  // Equivalent to PyTorch GELU with 'none' approximation.
+  // Refer to:
+  // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
+  constexpr float ALPHA = M_SQRT1_2;
+  float2 fval = cast_to_float2(val);
+  fval.x = fval.x * 0.5f * (1.0f + ::erf(fval.x * ALPHA));
+  fval.y = fval.y * 0.5f * (1.0f + ::erf(fval.y * ALPHA));
+  return cast_to_packed<packed_t>(fval);
 }
 
 // Activation and gating kernel template.
