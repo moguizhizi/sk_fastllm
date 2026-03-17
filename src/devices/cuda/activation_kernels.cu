@@ -350,6 +350,55 @@ __global__ void act_and_mul_kernel(scalar_t *__restrict__ out, // [..., d]
     }
 }
 
+template <typename scalar_t, typename packed_t, scalar_t (*ACT_FN)(const scalar_t &, const float),
+    packed_t (*PACKED_ACT_FN)(const packed_t &, const float), bool use_vec, bool use_256b = false>
+__global__ void act_and_mul_kernel_with_param(scalar_t *__restrict__ out, const scalar_t *__restrict__ input, const int d, const float param) {
+    const scalar_t *x_ptr = input + blockIdx.x * 2 * d;
+    const scalar_t *y_ptr = x_ptr + d;
+    scalar_t *out_ptr = out + blockIdx.x * d;
+
+    if constexpr (use_vec) {
+        // Fast path: 128-bit/256-bit vectorized loop
+        using vec_t = typename VecTraits<use_256b>::vec_t;
+        constexpr int ARCH_MAX_VEC_SIZE = VecTraits<use_256b>::ARCH_MAX_VEC_SIZE;
+        constexpr int VEC_SIZE = ARCH_MAX_VEC_SIZE / sizeof(packed_t);
+
+        const vec_t *x_vec = reinterpret_cast<const vec_t *>(x_ptr);
+        const vec_t *y_vec = reinterpret_cast<const vec_t *>(y_ptr);
+        vec_t *out_vec = reinterpret_cast<vec_t *>(out_ptr);
+        const int num_vecs = d / 2 / VEC_SIZE;
+
+        for (int i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+            vec_t x, y;
+            if constexpr (use_256b) {
+                ld256(x, &x_vec[i]);
+                ld256(y, &y_vec[i]);
+            } else {
+                x = FASTLLM_LDG(&x_vec[i]);
+                y = FASTLLM_LDG(&y_vec[i]);
+            }
+            auto *xp = reinterpret_cast<packed_t *>(&x);
+            auto *yp = reinterpret_cast<packed_t *>(&y);
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                xp[j] = packed_mul(PACKED_ACT_FN(xp[j], param), yp[j]);
+            }
+            if constexpr (use_256b) {
+                st256(x, &out_vec[i]);
+            } else {
+                out_vec[i] = x;
+            }
+        }
+    } else {
+        // Scalar fallback for unaligned data or small d
+        for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+            const scalar_t x = FASTLLM_LDG(&x_ptr[idx]);
+            const scalar_t y = FASTLLM_LDG(&y_ptr[idx]);
+            out_ptr[idx] = ACT_FN(x, param) * y;
+        }
+    }
+}
+
 VecConfig get_vec_config(uint32_t num_tokens, uint32_t elementSize, uint32_t num_elements) {
     VecConfig cfg{};
 
