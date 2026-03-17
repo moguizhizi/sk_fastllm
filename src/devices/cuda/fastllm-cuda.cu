@@ -17,7 +17,6 @@
 #include <algorithm>
 #include "sampling.cuh"
 #include <cuda_bf16.h>
-#include "activation_kernels.cuh"
 
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
@@ -2103,11 +2102,7 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
     return true;
 }
 
-#ifdef ENABLE_VLLM_KERNEL
-bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
-    return silu_and_mul(input, output);
-}
-#else
+
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     int len = output.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -2127,7 +2122,7 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
 }
-#endif
+
 
 
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output) {
