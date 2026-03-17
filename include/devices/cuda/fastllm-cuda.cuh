@@ -316,3 +316,9 @@ extern __global__ void FastllmCudaBF162HalfKernel(uint16_t* a, half *b, int len)
 extern __global__ void FastllmCudaHalf2BF16Kernel(half* a, __nv_bfloat16 *b, int len);
 extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k);
 #endif
+
+
+bool silu_and_mul(const fastllm::Data &input, fastllm::Data &output);
+bool mul_and_silu(const fastllm::Data &input, fastllm::Data &output);
+bool gelu_and_mul(const fastllm::Data &input, fastllm::Data &output);
+bool gelu_tanh_and_mul(const fastllm::Data &input, fastllm::Data &output);
