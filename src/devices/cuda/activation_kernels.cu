@@ -338,6 +338,20 @@ __device__ __forceinline__ packed_t packed_fatrelu_kernel(const packed_t &val, c
     return cast_to_packed<packed_t>(fval);
 }
 
+template <typename T>
+__device__ __forceinline__ T swigluoai_and_mul(const T &gate, const T &up, float alpha, float limit) {
+    // Clamp gate to (-inf, limit] and up to [-limit, limit]
+    const float g = fminf((float)gate, limit);
+    const float u = fmaxf(fminf((float)up, limit), -limit);
+    // glu = gate * sigmoid(gate * alpha), then return (up + 1) * glu
+    return (T)((u + 1.0f) * g / (1.0f + expf(-g * alpha)));
+}
+
+// Check if all pointers are 16-byte aligned for int4 vectorized access
+__host__ __device__ __forceinline__ bool is_16byte_aligned(const void *ptr) {
+    return (reinterpret_cast<uintptr_t>(ptr) & 15) == 0;
+}
+
 // Activation and gating kernel template.
 template <typename scalar_t, typename packed_t, scalar_t (*ACT_FN)(const scalar_t &), packed_t (*PACKED_ACT_FN)(const packed_t &),
     bool act_first, bool use_vec, bool use_256b>
@@ -435,6 +449,61 @@ __global__ void act_and_mul_kernel_with_param(scalar_t *__restrict__ out, const 
             const scalar_t x = FASTLLM_LDG(&x_ptr[idx]);
             const scalar_t y = FASTLLM_LDG(&y_ptr[idx]);
             out_ptr[idx] = ACT_FN(x, param) * y;
+        }
+    }
+}
+
+// Interleaved gate/up: input has [gate0, up0, gate1, up1, ...].
+template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &, const scalar_t &, const float,
+                                 const float)>
+__global__ void swigluoai_and_mul_kernel(scalar_t *__restrict__ out, // [..., d]
+    const scalar_t *__restrict__ input,                              // [..., 2 * d] (interleaved)
+    const int d, const float alpha, const float limit) {
+    // For interleaved data: input has 2*d elements per token (gate/up pairs)
+    // output has d elements per token
+    constexpr int VEC_SIZE = 16 / sizeof(scalar_t);
+    constexpr int PAIRS = VEC_SIZE / 2; // Number of gate/up pairs per int4 load
+    const int64_t token_idx = blockIdx.x;
+    const scalar_t *in_ptr = input + token_idx * 2 * d;
+    scalar_t *out_ptr = out + token_idx * d;
+
+    // Check alignment for 128-bit vectorized access on input.
+    // For output we use int2 (64-bit) which has 8-byte alignment requirement.
+    const bool in_aligned = is_16byte_aligned(in_ptr);
+    const bool out_aligned = (reinterpret_cast<uintptr_t>(out_ptr) & 7) == 0; // 8-byte for int2
+
+    if (in_aligned && out_aligned && d >= PAIRS) {
+        // Fast path: vectorized loop
+        // Each int4 load gives VEC_SIZE elements = PAIRS gate/up pairs
+        // Each int2 store writes PAIRS output elements
+        const int4 *in_vec = reinterpret_cast<const int4 *>(in_ptr);
+        int2 *out_vec = reinterpret_cast<int2 *>(out_ptr);
+        const int num_vecs = d / PAIRS;
+        const int vec_end = num_vecs * PAIRS;
+
+        for (int i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+            int4 v = FASTLLM_LDG(&in_vec[i]);
+            int2 r;
+            auto *vp = reinterpret_cast<scalar_t *>(&v);
+            auto *rp = reinterpret_cast<scalar_t *>(&r);
+#pragma unroll
+            for (int j = 0; j < PAIRS; j++) {
+                rp[j] = ACT_FN(vp[2 * j], vp[2 * j + 1], alpha, limit);
+            }
+            out_vec[i] = r;
+        }
+        // Scalar cleanup for remaining elements
+        for (int i = vec_end + threadIdx.x; i < d; i += blockDim.x) {
+            out_ptr[i] = ACT_FN(FASTLLM_LDG(&in_ptr[2 * i]), FASTLLM_LDG(&in_ptr[2 * i + 1]), alpha, limit);
+        }
+    } else {
+        // Scalar fallback for unaligned data or small d
+        for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+            // gate = x[..., ::2]  (even indices)
+            const scalar_t gate = FASTLLM_LDG(&in_ptr[2 * idx]);
+            // up = x[..., 1::2]   (odd indices)
+            const scalar_t up = FASTLLM_LDG(&in_ptr[2 * idx + 1]);
+            out_ptr[idx] = ACT_FN(gate, up, alpha, limit);
         }
     }
 }
