@@ -24,32 +24,26 @@
 
 #define LAUNCH_KERNEL(...) __VA_ARGS__
 
-#define FASTLLM_DISPATCH_FLOAT_TYPES(TYPE, ACT_FN, PACKED_ACT_FN, BODY)                        \
-    switch (TYPE) {                                                                            \
-        case fastllm::DataType::FLOAT32: {                                                     \
-            using scalar_t = float;                                                            \
-            using packed_t = float2;                                                           \
-            constexpr scalar_t (*act_fn)(const scalar_t &) = ACT_FN<float>;                    \
-            constexpr packed_t (*packed_fn)(const packed_t &) = PACKED_ACT_FN<float2>;         \
-            BODY;                                                                              \
-            break;                                                                             \
-        }                                                                                      \
-        case fastllm::DataType::FLOAT16: {                                                     \
-            using scalar_t = half;                                                             \
-            using packed_t = half2;                                                            \
-            constexpr scalar_t (*act_fn)(const scalar_t &) = ACT_FN<half>;                     \
-            constexpr packed_t (*packed_fn)(const packed_t &) = PACKED_ACT_FN<half2>;          \
-            BODY;                                                                              \
-            break;                                                                             \
-        }                                                                                      \
-        case fastllm::DataType::BFLOAT16: {                                                    \
-            using scalar_t = __nv_bfloat16;                                                    \
-            using packed_t = __nv_bfloat162;                                                   \
-            constexpr scalar_t (*act_fn)(const scalar_t &) = ACT_FN<__nv_bfloat16>;            \
-            constexpr packed_t (*packed_fn)(const packed_t &) = PACKED_ACT_FN<__nv_bfloat162>; \
-            BODY;                                                                              \
-            break;                                                                             \
-        }                                                                                      \
+#define FASTLLM_DISPATCH_FLOAT_TYPES(TYPE, ACT_FN, PACKED_ACT_FN, BODY) \
+    switch (TYPE) {                                                     \
+        case fastllm::DataType::FLOAT32: {                              \
+            using scalar_t = float;                                     \
+            using packed_t = float2;                                    \
+            BODY;                                                       \
+            break;                                                      \
+        }                                                               \
+        case fastllm::DataType::FLOAT16: {                              \
+            using scalar_t = half;                                      \
+            using packed_t = half2;                                     \
+            BODY;                                                       \
+            break;                                                      \
+        }                                                               \
+        case fastllm::DataType::BFLOAT16: {                             \
+            using scalar_t = __nv_bfloat16;                             \
+            using packed_t = __nv_bfloat162;                            \
+            BODY;                                                       \
+            break;                                                      \
+        }                                                               \
     }
 
 #define FASTLLM_ACT_MUL_BODY(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                           \
@@ -72,30 +66,76 @@
     dim3 grid(num_tokens);                                                               \
     dim3 block(vec_config.block_size);                                                   \
                                                                                          \
-    FASTLLM_ACT_MUL_LAUNCH(ACT_FN, PACKED_ACT_FN, ACT_FIRST);                            \
+    FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL(ACT_FN, PACKED_ACT_FN, ACT_FIRST);             \
                                                                                          \
     FastllmCudaFinishInput(input, cudaInput);                                            \
     FastllmCudaFinishOutput(output, cudaOutput);                                         \
     return true;
 
-#define FASTLLM_ACT_MUL_LAUNCH(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                                                \
-    if (vec_config.use_vec) {                                                                                   \
-        if (use_256b_flag) {                                                                                    \
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                               \
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, ACT_FIRST, true, true>  \
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                     \
-            });                                                                                                 \
-        } else {                                                                                                \
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                               \
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, ACT_FIRST, true, false> \
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                     \
-            });                                                                                                 \
-        }                                                                                                       \
-    } else {                                                                                                    \
-        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                   \
-            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, ACT_FIRST, false, false>    \
-                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                         \
-        });                                                                                                     \
+#define FASTLLM_ACT_MUL_BODY_WITH_PARAM(ACT_FN, PACKED_ACT_FN, PARAM)                    \
+    int input_len = input.Count(0);                                                      \
+    int output_len = output.Count(0);                                                    \
+                                                                                         \
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);                          \
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);                       \
+                                                                                         \
+    int spatial = input.Count(input.dims.size() - 1);                                    \
+    int mid = spatial / 2;                                                               \
+                                                                                         \
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];                      \
+    int elementSize = input.unitSize;                                                    \
+    int output_num_elements = mid;                                                       \
+                                                                                         \
+    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements); \
+    bool use_256b_flag = use_256b(num_tokens);                                           \
+                                                                                         \
+    dim3 grid(num_tokens);                                                               \
+    dim3 block(vec_config.block_size);                                                   \
+                                                                                         \
+    FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(ACT_FN, PACKED_ACT_FN, PARAM);      \
+                                                                                         \
+    FastllmCudaFinishInput(input, cudaInput);                                            \
+    FastllmCudaFinishOutput(output, cudaOutput);                                         \
+    return true;
+
+#define FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                                                         \
+    if (vec_config.use_vec) {                                                                                                           \
+        if (use_256b_flag) {                                                                                                            \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                                       \
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, ACT_FIRST, true, true>  \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                                             \
+            });                                                                                                                         \
+        } else {                                                                                                                        \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                                       \
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, ACT_FIRST, true, false> \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                                             \
+            });                                                                                                                         \
+        }                                                                                                                               \
+    } else {                                                                                                                            \
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                                           \
+            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, ACT_FIRST, false, false>    \
+                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                                                 \
+        });                                                                                                                             \
+    }
+
+#define FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(ACT_FN, PACKED_ACT_FN, PARAM)                                                  \
+    if (vec_config.use_vec) {                                                                                                           \
+        if (use_256b_flag) {                                                                                                            \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                                       \
+                LAUNCH_KERNEL(act_and_mul_kernel_with_param<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, true, true>  \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid, PARAM));                                      \
+            });                                                                                                                         \
+        } else {                                                                                                                        \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                                       \
+                LAUNCH_KERNEL(act_and_mul_kernel_with_param<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, true, false> \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid, PARAM));                                      \
+            });                                                                                                                         \
+        }                                                                                                                               \
+    } else {                                                                                                                            \
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                                           \
+            LAUNCH_KERNEL(act_and_mul_kernel_with_param<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, false, false>    \
+                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid, PARAM));                                          \
+        });                                                                                                                             \
     }
 
 struct VecConfig {
@@ -468,6 +508,10 @@ bool gelu_and_mul(const fastllm::Data &input, fastllm::Data &output) {
 
 bool gelu_tanh_and_mul(const fastllm::Data &input, fastllm::Data &output) {
     FASTLLM_ACT_MUL_BODY(gelu_tanh_kernel, packed_gelu_tanh_kernel, true);
+}
+
+bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double threshold) {
+    FASTLLM_ACT_MUL_BODY_WITH_PARAM(fatrelu_kernel, packed_fatrelu_kernel, threshold);
 }
 
 void showError(cudaError_t result, char const *const message, const char *const file, int const line) {
