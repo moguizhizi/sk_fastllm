@@ -44,6 +44,52 @@
         }                                                                                      \
     }
 
+#define FASTLLM_ACT_MUL_BODY(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                           \
+    int input_len = input.Count(0);                                                      \
+    int output_len = output.Count(0);                                                    \
+                                                                                         \
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);                          \
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);                       \
+                                                                                         \
+    int spatial = input.Count(input.dims.size() - 1);                                    \
+    int mid = spatial / 2;                                                               \
+                                                                                         \
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];                      \
+    int elementSize = input.unitSize;                                                    \
+    int output_num_elements = mid;                                                       \
+                                                                                         \
+    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements); \
+    bool use_256b_flag = use_256b(num_tokens);                                           \
+                                                                                         \
+    dim3 grid(num_tokens);                                                               \
+    dim3 block(vec_config.block_size);                                                   \
+                                                                                         \
+    FASTLLM_ACT_MUL_LAUNCH(ACT_FN, PACKED_ACT_FN, ACT_FIRST);                            \
+                                                                                         \
+    FastllmCudaFinishInput(input, cudaInput);                                            \
+    FastllmCudaFinishOutput(output, cudaOutput);                                         \
+    return true;
+
+#define FASTLLM_ACT_MUL_LAUNCH(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                                                \
+    if (vec_config.use_vec) {                                                                                   \
+        if (use_256b_flag) {                                                                                    \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                               \
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, ACT_FIRST, true, true>  \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                     \
+            });                                                                                                 \
+        } else {                                                                                                \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                               \
+                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, ACT_FIRST, true, false> \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                     \
+            });                                                                                                 \
+        }                                                                                                       \
+    } else {                                                                                                    \
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, ACT_FN, PACKED_ACT_FN, {                                   \
+            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, ACT_FIRST, false, false>    \
+                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                         \
+        });                                                                                                     \
+    }
+
 struct VecConfig {
     bool use_vec;
     int vec_size;
@@ -338,166 +384,17 @@ bool use_256b(uint32_t num_tokens) {
 }
 
 bool silu_and_mul(const fastllm::Data &input, fastllm::Data &output) {
-    int input_len = input.Count(0);
-    int output_len = output.Count(0);
-
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
-    int num_tokens = input_len / input.dims[input.dims.size() - 1];
-    int elementSize = input.unitSize;
-    int output_num_elements = mid;
-
-    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements);
-    bool use_256b_flag = use_256b(num_tokens);
-
-    dim3 grid(num_tokens);
-    dim3 block(vec_config.block_size);
-
-    if (vec_config.use_vec) {
-        if (use_256b_flag) {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, true>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        } else {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, false>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        }
-    } else {
-        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
-            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, false, false>
-                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-        });
-    }
-
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    FASTLLM_ACT_MUL_BODY(silu_kernel, packed_silu_kernel, true);
 }
 
-bool mul_and_silu(const fastllm::Data &input, fastllm::Data &output) // [..., 2 * d]
-{
-    int input_len = input.Count(0);
-    int output_len = output.Count(0);
-
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
-    int num_tokens = input_len / input.dims[input.dims.size() - 1];
-    int elementSize = input.unitSize;
-    int output_num_elements = mid;
-
-    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements);
-    bool use_256b_flag = use_256b(num_tokens);
-
-    dim3 grid(num_tokens);
-    dim3 block(vec_config.block_size);
-
-    if (vec_config.use_vec) {
-        if (use_256b_flag) {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, false, true, true>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        } else {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, false, true, false>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        }
-    } else {
-        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, silu_kernel, packed_silu_kernel, {
-            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, false, false, false>
-                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-        });
-    }
-
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+bool mul_and_silu(const fastllm::Data &input, fastllm::Data &output) {
+    FASTLLM_ACT_MUL_BODY(silu_kernel, packed_silu_kernel, false);
 }
 
 bool gelu_and_mul(const fastllm::Data &input, fastllm::Data &output) {
-    int input_len = input.Count(0);
-    int output_len = output.Count(0);
-
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
-    int num_tokens = input_len / input.dims[input.dims.size() - 1];
-    int elementSize = input.unitSize;
-    int output_num_elements = mid;
-
-    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements);
-    bool use_256b_flag = use_256b(num_tokens);
-
-    dim3 grid(num_tokens);
-    dim3 block(vec_config.block_size);
-
-    if (vec_config.use_vec) {
-        if (use_256b_flag) {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_kernel, packed_gelu_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, true>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        } else {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_kernel, packed_gelu_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, false>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        }
-    } else {
-        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_kernel, packed_gelu_kernel, {
-            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, false, false>
-                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-        });
-    }
-
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    FASTLLM_ACT_MUL_BODY(gelu_kernel, packed_gelu_kernel, true);
 }
 
 bool gelu_tanh_and_mul(const fastllm::Data &input, fastllm::Data &output) {
-    int input_len = input.Count(0);
-    int output_len = output.Count(0);
-
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
-    int num_tokens = input_len / input.dims[input.dims.size() - 1];
-    int elementSize = input.unitSize;
-    int output_num_elements = mid;
-
-    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements);
-    bool use_256b_flag = use_256b(num_tokens);
-
-    dim3 grid(num_tokens);
-    dim3 block(vec_config.block_size);
-
-    if (vec_config.use_vec) {
-        if (use_256b_flag) {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_tanh_kernel, packed_gelu_tanh_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, true>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        } else {
-            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_tanh_kernel, packed_gelu_tanh_kernel, {
-                LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, true, false>
-                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-            });
-        }
-    } else {
-        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, gelu_tanh_kernel, packed_gelu_tanh_kernel, {
-            LAUNCH_KERNEL(act_and_mul_kernel<scalar_t, packed_t, act_fn, packed_fn, true, false, false>
-                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));
-        });
-    }
-
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    FASTLLM_ACT_MUL_BODY(gelu_tanh_kernel, packed_gelu_tanh_kernel, true);
 }
