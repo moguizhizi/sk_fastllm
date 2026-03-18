@@ -533,6 +533,51 @@ __global__ void swigluoai_and_mul_kernel(scalar_t *__restrict__ out, // [..., d]
     }
 }
 
+// Element-wise activation kernel template.
+template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &), bool use_vec,
+    bool use_256b = false>
+__global__ void activation_kernel(scalar_t *__restrict__ out, // [..., d]
+    const scalar_t *__restrict__ input,                       // [..., d]
+    const int d) {
+    const scalar_t *in_ptr = input + blockIdx.x * d;
+    scalar_t *out_ptr = out + blockIdx.x * d;
+
+    if constexpr (use_vec) {
+        // Fast path: 128-bit/256-bit vectorized loop
+        using vec_t = typename VecTraits<use_256b>::vec_t;
+        constexpr int ARCH_MAX_VEC_SIZE = VecTraits<use_256b>::ARCH_MAX_VEC_SIZE;
+        constexpr int VEC_SIZE = ARCH_MAX_VEC_SIZE / sizeof(scalar_t);
+        const vec_t *in_vec = reinterpret_cast<const vec_t *>(in_ptr);
+        vec_t *out_vec = reinterpret_cast<vec_t *>(out_ptr);
+        const int num_vecs = d / VEC_SIZE;
+
+        for (int i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+            vec_t v;
+            if constexpr (use_256b) {
+                ld256(v, &in_vec[i]);
+            } else {
+                v = FASTLLM_LDG(&in_vec[i]);
+            }
+            auto *vp = reinterpret_cast<scalar_t *>(&v);
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                vp[j] = ACT_FN(vp[j]);
+            }
+            if constexpr (use_256b) {
+                st256(v, &out_vec[i]);
+            } else {
+                out_vec[i] = v;
+            }
+        }
+    } else {
+        // Scalar fallback for unaligned data or small d
+        for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+            const scalar_t x = FASTLLM_LDG(&in_ptr[idx]);
+            out_ptr[idx] = ACT_FN(x);
+        }
+    }
+}
+
 VecConfig get_vec_config(uint32_t num_tokens, uint32_t elementSize, uint32_t num_elements) {
     VecConfig cfg{};
 
