@@ -723,6 +723,10 @@ bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double a
     FASTLLM_SIGLUOAI_AND_MUL_BODY(swigluoai_and_mul, alpha, limit);
 }
 
+bool gelu(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+    FASTLLM_ACT_BODY(gelu_kernel);
+}
+
 bool gelu_new(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
     FASTLLM_ACT_BODY(gelu_new_kernel);
 }
@@ -1022,22 +1026,6 @@ __global__ void FastllmExpKernel(half *a, half *b, int len) {
     if (idx < len) {
         float x = __half2float(a[idx]);
         b[idx] = __float2half(exp((double)x));
-    }
-}
-
-__global__ void FastllmGeluKernel(float *a, float *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = a[idx];
-        b[idx] = x * 0.5f * (1.0f + erff(x / 1.41421));
-    }
-}
-
-__global__ void FastllmGeluKernel(half *a, half *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = __half2float(a[idx]);
-        b[idx] = __float2half(x * 0.5f * (1.0f + erff(x / 1.41421)));
     }
 }
 
@@ -2699,18 +2687,7 @@ bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output) {
 }
 
 bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output) {
-    int len = input.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(256, len);
-    if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmGeluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>((half *)cudaInput, (half *)cudaOutput, len);
-    } else if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmGeluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
-    }
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return gelu(input, output);
 }
 
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
