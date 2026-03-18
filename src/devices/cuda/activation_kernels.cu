@@ -2722,14 +2722,7 @@ bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output) {
 }
 
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
-    int len = input.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(256, len);
-    FastllmGeluNewKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return gelu_new(input, output);
 }
 
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
