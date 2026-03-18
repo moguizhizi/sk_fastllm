@@ -332,6 +332,11 @@ __device__ __forceinline__ T silu_kernel(const T &x) {
     return (T)(((float)x) / (1.0f + expf((float)-x)));
 }
 
+template <typename T>
+__device__ __forceinline__ T sigmoid_kernel(const T &x) {
+    return (T)(1.0f / (1.0f + expf((float)-x)));
+}
+
 template <typename packed_t>
 __device__ __forceinline__ packed_t packed_silu_kernel(const packed_t &val) {
     // x * sigmoid(x)
@@ -723,6 +728,14 @@ bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double a
     FASTLLM_SIGLUOAI_AND_MUL_BODY(swigluoai_and_mul, alpha, limit);
 }
 
+bool silu(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+    FASTLLM_ACT_BODY(silu_kernel);
+}
+
+bool sigmoid(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+    FASTLLM_ACT_BODY(sigmoid_kernel);
+}
+
 bool gelu(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
     FASTLLM_ACT_BODY(gelu_kernel);
 }
@@ -1026,48 +1039,6 @@ __global__ void FastllmExpKernel(half *a, half *b, int len) {
     if (idx < len) {
         float x = __half2float(a[idx]);
         b[idx] = __float2half(exp((double)x));
-    }
-}
-
-__global__ void FastllmSiluKernel(float *a, float *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = a[idx];
-        b[idx] = x / (1.0 + expf(-x));
-    }
-}
-
-__global__ void FastllmSiluKernel(half *a, half *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-#ifdef CUDA_NO_TENSOR_CORE
-        float x = __half2float(a[idx]);
-        b[idx] = __float2half((x / (1.0 + expf(-x))));
-#else
-        half x = a[idx];
-        b[idx] = __hdiv(x, __hadd(__float2half(1.0), hexp(-x)));
-#endif
-    }
-}
-
-__global__ void FastllmSigmoidKernel(float *a, float *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = a[idx];
-        b[idx] = 1.0 / (1.0 + expf(-x));
-    }
-}
-
-__global__ void FastllmSigmoidKernel(half *a, half *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-#ifdef CUDA_NO_TENSOR_CORE
-        float x = __half2float(a[idx]);
-        b[idx] = __float2half(1.0 / (1.0 + expf(-x)));
-#else
-        half x = a[idx];
-        b[idx] = __hdiv(1.0, __hadd(__float2half(1.0), hexp(-x)));
-#endif
     }
 }
 
@@ -2695,33 +2666,11 @@ bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
 }
 
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
-    int len = input.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(1024, len);
-    if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmSiluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmSiluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>((half *)cudaInput, (half *)cudaOutput, len);
-    }
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return silu(input, output);
 }
 
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
-    int len = input.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(1024, len);
-    if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmSigmoidKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmSigmoidKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>((half *)cudaInput, (half *)cudaOutput, len);
-    }
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return sigmoid(input, output);
 }
 
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData) {
