@@ -34,7 +34,7 @@
         }                                        \
         case fastllm::DataType::FLOAT16: {       \
             using scalar_t = half;               \
-            using packed_t = half2;              \
+            using packed_t = __half2;            \
             BODY;                                \
             break;                               \
         }                                        \
@@ -335,6 +335,16 @@ __device__ __forceinline__ T silu_kernel(const T &x) {
 template <typename T>
 __device__ __forceinline__ T sigmoid_kernel(const T &x) {
     return (T)(1.0f / (1.0f + expf((float)-x)));
+}
+
+template <typename T>
+__device__ __forceinline__ T exp_fast_kernel(const T &x) {
+    return (T)__expf((float)x);
+}
+
+template <typename T>
+__device__ __forceinline__ T exp_kernel(const T &x) {
+    return (T)expf((float)x);
 }
 
 template <typename packed_t>
@@ -732,6 +742,14 @@ bool silu(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
     FASTLLM_ACT_BODY(silu_kernel);
 }
 
+bool exp(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+    FASTLLM_ACT_BODY(exp_kernel);
+}
+
+bool exp_fast(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+    FASTLLM_ACT_BODY(exp_fast_kernel);
+}
+
 bool sigmoid(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
     FASTLLM_ACT_BODY(sigmoid_kernel);
 }
@@ -1023,22 +1041,6 @@ __global__ void FastllmReluKernel(float *a, float *b, int len) {
     if (idx < len) {
         float x = a[idx];
         b[idx] = x > 0 ? x : 0;
-    }
-}
-
-__global__ void FastllmExpKernel(float *a, float *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = a[idx];
-        b[idx] = exp((double)x);
-    }
-}
-
-__global__ void FastllmExpKernel(half *a, half *b, int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = __half2float(a[idx]);
-        b[idx] = __float2half(exp((double)x));
     }
 }
 
@@ -2624,21 +2626,7 @@ void FastllmCudaMemcpy2DDeviceToDeviceBatch(
 }
 
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output) {
-    int len = input.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(256, len);
-    if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmExpKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmExpKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>((half *)cudaInput, (half *)cudaOutput, len);
-    } else {
-        printf("Exp datatype error.\n");
-        exit(0);
-    }
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return exp(input, output);
 }
 
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output) {
