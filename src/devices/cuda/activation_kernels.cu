@@ -117,6 +117,32 @@
     FastllmCudaFinishOutput(output, cudaOutput);                                         \
     return true;
 
+#define FASTLLM_ACT_BODY(ACT_FN)                                                         \
+    int input_len = input.Count(0);                                                      \
+    int output_len = output.Count(0);                                                    \
+                                                                                         \
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);                          \
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);                       \
+                                                                                         \
+    int spatial = input.Count(input.dims.size() - 1);                                    \
+    int mid = spatial;                                                                   \
+                                                                                         \
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];                      \
+    int elementSize = input.unitSize;                                                    \
+    int output_num_elements = mid;                                                       \
+                                                                                         \
+    VecConfig vec_config = get_vec_config(num_tokens, elementSize, output_num_elements); \
+    bool use_256b_flag = use_256b(num_tokens);                                           \
+                                                                                         \
+    dim3 grid(num_tokens);                                                               \
+    dim3 block(vec_config.block_size);                                                   \
+                                                                                         \
+    FASTLLM_LAUNCH_ACTIVATION_KERNEL(ACT_FN);                                            \
+                                                                                         \
+    FastllmCudaFinishInput(input, cudaInput);                                            \
+    FastllmCudaFinishOutput(output, cudaOutput);                                         \
+    return true;
+
 #define FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                                                         \
     if (vec_config.use_vec) {                                                                                                           \
         if (use_256b_flag) {                                                                                                            \
@@ -161,6 +187,26 @@
             LAUNCH_KERNEL(act_and_mul_kernel_with_param<scalar_t, packed_t, ACT_FN<scalar_t>, PACKED_ACT_FN<packed_t>, false, false>    \
                 <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid, PARAM));                                          \
         });                                                                                                                             \
+    }
+
+#define FASTLLM_LAUNCH_ACTIVATION_KERNEL(ACT_FN)                                            \
+    if (vec_config.use_vec) {                                                               \
+        if (use_256b_flag) {                                                                \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                  \
+                LAUNCH_KERNEL(activation_kernel<scalar_t, ACT_FN<scalar_t>, true, true>     \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid)); \
+            });                                                                             \
+        } else {                                                                            \
+            FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                  \
+                LAUNCH_KERNEL(activation_kernel<scalar_t, ACT_FN<scalar_t>, true, false>    \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid)); \
+            });                                                                             \
+        }                                                                                   \
+    } else {                                                                                \
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                      \
+            LAUNCH_KERNEL(activation_kernel<scalar_t, ACT_FN<scalar_t>, false, false>       \
+                <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));     \
+        });                                                                                 \
     }
 
 struct VecConfig {
@@ -370,6 +416,26 @@ __device__ __forceinline__ T swigluoai_and_mul(const T &gate, const T &up, float
     const float u = fmaxf(fminf((float)up, limit), -limit);
     // glu = gate * sigmoid(gate * alpha), then return (up + 1) * glu
     return (T)((u + 1.0f) * g / (1.0f + expf(-g * alpha)));
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_new_kernel(const T &x) {
+    const float x3 = (float)(x * x * x);
+    const T t = (T)tanhf((T)(0.79788456f * (float)(x + (T)(0.044715f * x3))));
+    return ((T)0.5) * x * (((T)1.0) + t);
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_fast_kernel(const T &x) {
+    const float f = (float)x;
+    const T t = (T)tanhf(((T)(f * 0.79788456f)) * (((T)1.0) + (T)(0.044715f * f) * x));
+    return ((T)0.5) * x * (((T)1.0) + t);
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_quick_kernel(const T &x) {
+    // x * sigmoid(1.702 * x)
+    return (T)(((float)x) / (1.0f + expf(-1.702f * (float)x)));
 }
 
 // Check if all pointers are 16-byte aligned for int4 vectorized access
@@ -655,6 +721,20 @@ bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double t
 
 bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double alpha, double limit) {
     FASTLLM_SIGLUOAI_AND_MUL_BODY(swigluoai_and_mul, alpha, limit);
+}
+
+bool gelu_new(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+    FASTLLM_ACT_BODY(gelu_new_kernel);
+}
+
+bool gelu_fast(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+
+    FASTLLM_ACT_BODY(gelu_fast_kernel);
+}
+
+bool gelu_quick(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
+
+    FASTLLM_ACT_BODY(gelu_quick_kernel);
 }
 
 void showError(cudaError_t result, char const *const message, const char *const file, int const line) {
@@ -2642,14 +2722,7 @@ bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output) {
 }
 
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
-    int len = input.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(256, len);
-    FastllmGeluNewKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return gelu_new(input, output);
 }
 
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
