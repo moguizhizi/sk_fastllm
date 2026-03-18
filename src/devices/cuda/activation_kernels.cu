@@ -72,16 +72,24 @@
     FastllmCudaFinishOutput(output, cudaOutput);                                         \
     return true;
 
-#define FASTLLM_SIGLUOAI_AND_MUL(KERNEL, ALPHA, LIMIT)              \
+#define FASTLLM_SIGLUOAI_AND_MUL_BODY(KERNEL, ALPHA, LIMIT)         \
     int input_len = input.Count(0);                                 \
+                                                                    \
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);     \
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);  \
     int spatial = input.Count(input.dims.size() - 1);               \
     int mid = spatial / 2;                                          \
                                                                     \
     int num_tokens = input_len / input.dims[input.dims.size() - 1]; \
                                                                     \
-    int64_t num_tokens = input.numel() / input.size(-1);            \
     dim3 grid(num_tokens);                                          \
-    dim3 block(std::min(mid, 1024));
+    dim3 block(std::min(mid, 1024));                                \
+                                                                    \
+    FASTLLM_LAUNCH_SIGLUOAI_AND_MUL_KERNEL(KERNEL, ALPHA, LIMIT)    \
+                                                                    \
+    FastllmCudaFinishInput(input, cudaInput);                       \
+    FastllmCudaFinishOutput(output, cudaOutput);                    \
+    return true;
 
 #define FASTLLM_ACT_MUL_BODY_WITH_PARAM(ACT_FN, PACKED_ACT_FN, PARAM)                    \
     int input_len = input.Count(0);                                                      \
@@ -128,6 +136,12 @@
                 <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid));                                                 \
         });                                                                                                                             \
     }
+
+#define FASTLLM_LAUNCH_SIGLUOAI_AND_MUL_KERNEL(ACT_FN, ALPHA, LIMIT)                              \
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                                \
+        LAUNCH_KERNEL(swigluoai_and_mul_kernel<scalar_t, ACT_FN<scalar_t>>                        \
+            <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid, ALPHA, LIMIT)); \
+    });
 
 #define FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(ACT_FN, PACKED_ACT_FN, PARAM)                                                  \
     if (vec_config.use_vec) {                                                                                                           \
@@ -592,6 +606,10 @@ bool gelu_tanh_and_mul(const fastllm::Data &input, fastllm::Data &output) {
 
 bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double threshold) {
     FASTLLM_ACT_MUL_BODY_WITH_PARAM(fatrelu_kernel, packed_fatrelu_kernel, threshold);
+}
+
+bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double alpha, double limit) {
+    FASTLLM_SIGLUOAI_AND_MUL_BODY(swigluoai_and_mul, alpha, limit);
 }
 
 void showError(cudaError_t result, char const *const message, const char *const file, int const line) {
