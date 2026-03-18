@@ -1062,38 +1062,6 @@ __global__ void FastllmMambaSoftplusKernel(half *inputData, half *outputData, fl
     }
 }
 
-__global__ void FastllmSwigluKernel(float *__restrict__ a, float *__restrict__ b, int len, int spatial, int mid) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        int id = idx / mid * spatial + idx % mid;
-        float x = a[id], y = a[id + mid];
-        b[idx] = (x / (1.0f + expf(-x))) * y;
-    }
-}
-
-__global__ void FastllmSwigluKernel(half *__restrict__ a, half *__restrict__ b, int len, int spatial, int mid) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        int id = idx / mid * spatial + idx % mid;
-#ifdef CUDA_NO_TENSOR_CORE
-        float x = __half2float(a[id]), y = __half2float(a[id + mid]);
-        b[idx] = __float2half((x / (1.0 + expf(-x))) * y);
-#else
-        half x = a[id], y = a[id + mid];
-        b[idx] = __hmul(__hdiv(x, __hadd(__float2half(1.0), hexp(-x))), y);
-#endif
-    }
-}
-
-__global__ void FastllmSwigluKernel(__nv_bfloat16 *__restrict__ a, __nv_bfloat16 *__restrict__ b, int len, int spatial, int mid) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        int id = idx / mid * spatial + idx % mid;
-        float x = __bfloat162float(a[id]), y = __bfloat162float(a[id + mid]);
-        b[idx] = __float2bfloat16((x / (1.0f + expf(-x))) * y);
-    }
-}
-
 // CrossSwiglu: 交替存储格式, y[i] = x[i*2+1] * silu(x[i*2])
 __global__ void FastllmCrossSwigluKernel(float *__restrict__ a, float *__restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
