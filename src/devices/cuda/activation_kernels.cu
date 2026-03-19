@@ -72,6 +72,25 @@
     FastllmCudaFinishOutput(output, cudaOutput);                                         \
     return true;
 
+#define FASTLLM_CROSS_ACTIVATION_AND_MUL_BODY(KERNEL)               \
+    int input_len = input.Count(0);                                 \
+                                                                    \
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);     \
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);  \
+    int spatial = input.Count(input.dims.size() - 1);               \
+    int mid = spatial / 2;                                          \
+                                                                    \
+    int num_tokens = input_len / input.dims[input.dims.size() - 1]; \
+                                                                    \
+    dim3 grid(num_tokens);                                          \
+    dim3 block(std::min(mid, 1024));                                \
+                                                                    \
+    FASTLLM_LAUNCH_CROSS_ACTIVATION_AND_MUL_KERNEL(KERNEL)          \
+                                                                    \
+    FastllmCudaFinishInput(input, cudaInput);                       \
+    FastllmCudaFinishOutput(output, cudaOutput);                    \
+    return true;
+
 #define FASTLLM_SIGLUOAI_AND_MUL_BODY(KERNEL, ALPHA, LIMIT)         \
     int input_len = input.Count(0);                                 \
                                                                     \
@@ -193,6 +212,12 @@
     FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                                \
         LAUNCH_KERNEL(swigluoai_and_mul_kernel<scalar_t, ACT_FN<scalar_t>>                        \
             <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid, ALPHA, LIMIT)); \
+    });
+
+#define FASTLLM_LAUNCH_CROSS_ACTIVATION_AND_MUL_KERNEL(ACT_FN)                                                                                 \
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                                                                             \
+        LAUNCH_KERNEL(                                                                                                                         \
+            cross_activation_and_mul_kernel<scalar_t, ACT_FN<scalar_t>><<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput, mid)); \
     });
 
 #define FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(ACT_FN, PACKED_ACT_FN, PARAM)                                                  \
@@ -480,6 +505,30 @@ __device__ __forceinline__ T swigluoai_and_mul(const T &gate, const T &up, float
 }
 
 template <typename T>
+__device__ __forceinline__ T cross_silu_and_mul_kernel(const T &x, const T &y) {
+    if constexpr (std::is_same_v<T, float>) {
+        // float路径
+        return x * (1.0f / (1.0f + __expf(-x))) * y;
+
+    } else if constexpr (std::is_same_v<T, half>) {
+        // half路径（保持原生half算子）
+        half one = __float2half(1.0f);
+        return __hmul(__hmul(x, __hdiv(one, __hadd(one, hexp(__hneg(x))))), y);
+
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        // bf16路径（走float）
+        float xf = __bfloat162float(x);
+        float yf = __bfloat162float(y);
+        float r = xf * (1.0f / (1.0f + __expf(-xf))) * yf;
+        return __float2bfloat16(r);
+
+    } else {
+        // 防止误用
+        static_assert(!sizeof(T *), "Unsupported type");
+    }
+}
+
+template <typename T>
 __device__ __forceinline__ T gelu_new_kernel(const T &x) {
     const float x3 = (float)(x * x * x);
     const T t = (T)tanhf((T)(0.79788456f * (float)(x + (T)(0.044715f * x3))));
@@ -660,6 +709,59 @@ __global__ void swigluoai_and_mul_kernel(scalar_t *__restrict__ out, // [..., d]
     }
 }
 
+template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &, const scalar_t &)>
+__global__ void cross_activation_and_mul_kernel(scalar_t *__restrict__ out, // [..., d]
+    const scalar_t *__restrict__ input,                                     // [..., 2 * d] (interleaved)
+    const int d) {
+    // For interleaved data: input has 2*d elements per token (gate/up pairs)
+    // output has d elements per token
+    constexpr int VEC_SIZE = 16 / sizeof(scalar_t);
+    constexpr int PAIRS = VEC_SIZE / 2; // Number of gate/up pairs per int4 load
+    const int64_t token_idx = blockIdx.x;
+    const scalar_t *in_ptr = input + token_idx * 2 * d;
+    scalar_t *out_ptr = out + token_idx * d;
+
+    // Check alignment for 128-bit vectorized access on input.
+    // For output we use int2 (64-bit) which has 8-byte alignment requirement.
+    const bool in_aligned = is_16byte_aligned(in_ptr);
+    const bool out_aligned = (reinterpret_cast<uintptr_t>(out_ptr) & 7) == 0; // 8-byte for int2
+
+    if (in_aligned && out_aligned && d >= PAIRS) {
+        // Fast path: vectorized loop
+        // Each int4 load gives VEC_SIZE elements = PAIRS gate/up pairs
+        // Each int2 store writes PAIRS output elements
+        const int4 *in_vec = reinterpret_cast<const int4 *>(in_ptr);
+        int2 *out_vec = reinterpret_cast<int2 *>(out_ptr);
+        const int num_vecs = d / PAIRS;
+        const int vec_end = num_vecs * PAIRS;
+
+        for (int i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+            int4 v = FASTLLM_LDG(&in_vec[i]);
+            int2 r;
+            auto *vp = reinterpret_cast<scalar_t *>(&v);
+            auto *rp = reinterpret_cast<scalar_t *>(&r);
+#pragma unroll
+            for (int j = 0; j < PAIRS; j++) {
+                rp[j] = ACT_FN(vp[2 * j], vp[2 * j + 1]);
+            }
+            out_vec[i] = r;
+        }
+        // Scalar cleanup for remaining elements
+        for (int i = vec_end + threadIdx.x; i < d; i += blockDim.x) {
+            out_ptr[i] = ACT_FN(FASTLLM_LDG(&in_ptr[2 * i]), FASTLLM_LDG(&in_ptr[2 * i + 1]));
+        }
+    } else {
+        // Scalar fallback for unaligned data or small d
+        for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+            // gate = x[..., ::2]  (even indices)
+            const scalar_t gate = FASTLLM_LDG(&in_ptr[2 * idx]);
+            // up = x[..., 1::2]   (odd indices)
+            const scalar_t up = FASTLLM_LDG(&in_ptr[2 * idx + 1]);
+            out_ptr[idx] = ACT_FN(gate, up);
+        }
+    }
+}
+
 // Element-wise activation kernel template.
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &), bool use_vec,
     bool use_256b = false>
@@ -825,8 +927,12 @@ bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double t
     FASTLLM_ACT_MUL_BODY_WITH_PARAM(fatrelu_kernel, packed_fatrelu_kernel, threshold);
 }
 
-bool fatrelu_and_mul(const fastllm::Data &input, fastllm::Data &output, double alpha, double limit) {
+bool clamped_swiglu_and_mul(const fastllm::Data &input, fastllm::Data &output, double alpha, double limit) {
     FASTLLM_SIGLUOAI_AND_MUL_BODY(swigluoai_and_mul, alpha, limit);
+}
+
+bool cross_silu_and_mul(const fastllm::Data &input, fastllm::Data &output) {
+    FASTLLM_CROSS_ACTIVATION_AND_MUL_BODY(cross_silu_and_mul_kernel);
 }
 
 bool silu(const fastllm::Data &input, fastllm::Data &output) { // [..., d]
@@ -1146,45 +1252,6 @@ __global__ void FastllmMambaSoftplusKernel(half *inputData, half *outputData, fl
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
         outputData[o * channels + i] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
-    }
-}
-
-// CrossSwiglu: 交替存储格式, y[i] = x[i*2+1] * silu(x[i*2])
-__global__ void FastllmCrossSwigluKernel(float *__restrict__ a, float *__restrict__ b, int len, int spatial, int mid) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        int outer = idx / mid;
-        int inner = idx % mid;
-        int id = outer * spatial + inner * 2;
-        float x = a[id], y = a[id + 1];
-        b[idx] = (x / (1.0f + expf(-x))) * y;
-    }
-}
-
-__global__ void FastllmCrossSwigluKernel(half *__restrict__ a, half *__restrict__ b, int len, int spatial, int mid) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        int outer = idx / mid;
-        int inner = idx % mid;
-        int id = outer * spatial + inner * 2;
-#ifdef CUDA_NO_TENSOR_CORE
-        float x = __half2float(a[id]), y = __half2float(a[id + 1]);
-        b[idx] = __float2half((x / (1.0 + expf(-x))) * y);
-#else
-        half x = a[id], y = a[id + 1];
-        b[idx] = __hmul(__hdiv(x, __hadd(__float2half(1.0), hexp(-x))), y);
-#endif
-    }
-}
-
-__global__ void FastllmCrossSwigluKernel(__nv_bfloat16 *__restrict__ a, __nv_bfloat16 *__restrict__ b, int len, int spatial, int mid) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        int outer = idx / mid;
-        int inner = idx % mid;
-        int id = outer * spatial + inner * 2;
-        float x = __bfloat162float(a[id]), y = __bfloat162float(a[id + 1]);
-        b[idx] = __float2bfloat16((x / (1.0f + expf(-x))) * y);
     }
 }
 
@@ -2732,24 +2799,7 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
 }
 
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output) {
-    int len = output.Count(0);
-    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
-    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
-
-    int threadPerBlock = std::min(1024, len);
-    if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmCrossSwigluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmCrossSwigluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>((half *)cudaInput, (half *)cudaOutput, len, spatial, mid);
-    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmCrossSwigluKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(
-            (__nv_bfloat16 *)cudaInput, (__nv_bfloat16 *)cudaOutput, len, spatial, mid);
-    }
-
-    FastllmCudaFinishInput(input, cudaInput);
-    FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return cross_silu_and_mul(input, output);
 }
 
 bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output) {
