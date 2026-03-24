@@ -1,5 +1,5 @@
-/* #include <thrust/device_vector.h>
 #include <thrust/sort.h>
+/* #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
 #include <thrust/gather.h>
 #include <thrust/copy.h>
@@ -9,11 +9,15 @@
 #include "fastllm.h"
 #include "utils/utils.h"
 
+
 #include <cstdlib>
 #include <random>
 #include <type_traits>
 #include <cuda_fp8.h>
+#include <algorithm>
 #include "sampling.cuh"
+#include <cuda_bf16.h>
+#include "activation_kernels.cuh"
 
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
@@ -2184,6 +2188,7 @@ bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fa
     return true;
 }
 
+
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     int len = output.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -2203,6 +2208,7 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
 }
+
 
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     int len = output.Count(0);
