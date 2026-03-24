@@ -17,7 +17,6 @@
 #include <algorithm>
 #include "sampling.cuh"
 #include <cuda_bf16.h>
-#include "activation_kernels.cuh"
 
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
@@ -2156,35 +2155,6 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
     FastllmCudaFinishInput(aLogData, aLog);
     FastllmCudaFinishInput(dtBiasData, dtBias);
     FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
-}
-
-bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput,
-                                     fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData) {
-    if (sigmoidInputOutput.dataDevice != fastllm::DataDevice::CUDA ||
-        softplusInput.dataDevice != fastllm::DataDevice::CUDA ||
-        softplusOutput.dataDevice != fastllm::DataDevice::CUDA ||
-        aLogData.dataDevice != fastllm::DataDevice::CUDA ||
-        dtBiasData.dataDevice != fastllm::DataDevice::CUDA) {
-        return false;
-    }
-
-    int dimsLen = softplusInput.dims.size();
-    int outer = softplusInput.Count(0) / softplusInput.Count(dimsLen - 1);
-    int channels = softplusInput.dims[dimsLen - 1];
-    int threadPerBlock = std::min(64, channels);
-    if (sigmoidInputOutput.dataType == fastllm::DataType::FLOAT32) {
-        FastllmSigmoidMambaSoftplusKernel<<<outer, threadPerBlock>>>(
-            (float *) sigmoidInputOutput.cudaData, (const float *) softplusInput.cudaData,
-            (float *) softplusOutput.cudaData, (const float *) aLogData.cudaData, (const float *) dtBiasData.cudaData, channels);
-    } else if (sigmoidInputOutput.dataType == fastllm::DataType::FLOAT16) {
-        FastllmSigmoidMambaSoftplusKernel<<<outer, threadPerBlock>>>(
-            (half *) sigmoidInputOutput.cudaData, (const half *) softplusInput.cudaData,
-            (half *) softplusOutput.cudaData, (const float *) aLogData.cudaData, (const float *) dtBiasData.cudaData, channels);
-    } else {
-        return false;
-    }
-    DeviceSync();
     return true;
 }
 

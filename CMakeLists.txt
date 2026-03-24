@@ -259,9 +259,27 @@ if (USE_CUDA)
     endif()
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
-        src/devices/cuda/fastllm-cuda.cu 
-        src/devices/cuda/activation_kernels.cu
+    
+    set(FASTLLM_CUDA_SOURCES
+        src/devices/cuda/cudadevice.cpp
+        src/devices/cuda/cudadevicebatch.cpp
+    )
+
+    # 根据 ENABLE_VLLM_KERNEL 选择 activation kernel 实现
+    if(ENABLE_VLLM_KERNEL)
+        message(STATUS "Using vLLM activation kernels")
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/activation_kernels.cu
+        )
+    else()
+        message(STATUS "Using fastllm activation kernels")
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/fastllm-cuda.cu
+        )
+    endif()
+
+    # 其他 CUDA 文件
+    list(APPEND FASTLLM_CUDA_SOURCES
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
@@ -271,7 +289,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
-        src/devices/cuda/linear/fastllm-linear-int4nozero.cu)
+        src/devices/cuda/linear/fastllm-linear-int4nozero.cu
+    )
 
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
