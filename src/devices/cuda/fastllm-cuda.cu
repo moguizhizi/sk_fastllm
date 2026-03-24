@@ -2180,6 +2180,7 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
 }
 
 
+
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     int len = output.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
