@@ -27,6 +27,36 @@
       TORCH_CHECK(false, "Expects rank 2, 3 or 4 tensors but got ", NUM_DIMS); \
   }
 
+#define FASTLLM_DISPATCH_VEC_SIZE(VEC_SIZE, ...)    \
+    switch (VEC_SIZE) {                             \
+        case 16: {                                  \
+            constexpr int vec_size = 16;            \
+            __VA_ARGS__();                          \
+            break;                                  \
+        }                                           \
+        case 8: {                                   \
+            constexpr int vec_size = 8;             \
+            __VA_ARGS__();                          \
+            break;                                  \
+        }                                           \
+        case 4: {                                   \
+            constexpr int vec_size = 4;             \
+            __VA_ARGS__();                          \
+            break;                                  \
+        }                                           \
+        case 2: {                                   \
+            constexpr int vec_size = 2;             \
+            __VA_ARGS__();                          \
+            break;                                  \
+        }                                           \
+        default: {                                  \
+            constexpr int vec_size = 1;             \
+            __VA_ARGS__();                          \
+            break;                                  \
+        }                                           \
+    }
+
+
 template <typename scalar_t, int VEC_SIZE, int NUM_DIMS>
 __global__ void rms_norm_kernel(
     scalar_t *__restrict__ out,          // [..., hidden_size]
