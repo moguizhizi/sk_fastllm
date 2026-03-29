@@ -2,10 +2,9 @@
 #include <cub/cub.cuh>
 #include "vectorization_utils.cuh"
 #include "cup_helpers.h"
+#include "kernel_macros.cuh"
 #include <torch/all.h>
 #include <torch/extension.h>
-
-#define LAUNCH_KERNEL(...) __VA_ARGS__
 
 #define FASTLLM_DISPATCH_RANK234(NUM_DIMS, ...)                                \
   switch (NUM_DIMS) {                                                          \
