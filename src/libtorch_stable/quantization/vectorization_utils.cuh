@@ -1,4 +1,19 @@
 
+template <int VEC_SIZE, typename InT, typename ScaOp>
+struct DefaultReadVecOp
+{
+    ScaOp scalar_op;
+
+    __device__ __forceinline__ void operator()(
+        const vec_n_t<InT, VEC_SIZE> &src) const
+    {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i)
+        {
+            scalar_op(src.val[i]);
+        }
+    }
+};
 
 // read-only version: iterate over the input with alignment guarantees
 template <int VEC_SIZE, typename InT, typename VecOp, typename ScaOp>
