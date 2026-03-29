@@ -197,7 +197,7 @@ __global__ void rms_norm_kernel(
                                                                                          \
     dim3 grid(num_tokens);                                                               \
                                                                                          \
-    FASTLLM_LAUNCH_RMSNORM_KERNEL();                                             \
+    FASTLLM_LAUNCH_RMSNORM_KERNEL();                                                     \
                                                                                          \
     FastllmCudaFinishInput(input, cudaInput);                                            \
     FastllmCudaFinishOutput(output, cudaOutput);                                         \
