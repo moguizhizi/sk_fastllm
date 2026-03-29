@@ -8,13 +8,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <fastllm-cuda.cuh>
 #include <random>
 #include <type_traits>
 
 #include "fastllm.h"
 #include "sampling.cuh"
 #include "utils/utils.h"
+#include "activation_kernels.cuh"
 
 #ifndef USE_ROCM
 #    define FASTLLM_LDG(arg) __ldg(arg)
