@@ -15,14 +15,13 @@
 #include "sampling.cuh"
 #include "utils/utils.h"
 #include "activation_kernels.cuh"
+#include "kernel_macros.cuh"
 
 #ifndef USE_ROCM
 #    define FASTLLM_LDG(arg) __ldg(arg)
 #else
 #    define FASTLLM_LDG(arg) *(arg)
 #endif
-
-#define LAUNCH_KERNEL(...) __VA_ARGS__
 
 #define FASTLLM_DISPATCH_FLOAT_TYPES(TYPE, BODY) \
     switch (TYPE) {                              \
