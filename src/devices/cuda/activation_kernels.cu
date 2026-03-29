@@ -2747,30 +2747,6 @@ void FastllmCudaMemcpy2DDeviceToDeviceBatch(
     DeviceSync();
 }
 
-bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output) {
-    return exp(input, output);
-}
-
-bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output) {
-    return fatrelu(input, output, 0);
-}
-
-bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output) {
-    return gelu(input, output);
-}
-
-bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
-    return gelu_new(input, output);
-}
-
-bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
-    return silu(input, output);
-}
-
-bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
-    return sigmoid(input, output);
-}
-
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData) {
     int dimsLen = input.dims.size();
     int outer = input.Count(0) / input.Count(dimsLen - 1);
