@@ -177,7 +177,7 @@ void rms_norm_(torch::Tensor &out,    // [..., hidden_size]
       const int block_size =
           std::min(hidden_size / calculated_vec_size, max_block_size);
       dim3 block(block_size);
-      VLLM_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
+      FASTLLM_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
         vllm::rms_norm_kernel<scalar_t, vec_size, tensor_rank>
             <<<grid, block, 0, stream>>>(
                 out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
