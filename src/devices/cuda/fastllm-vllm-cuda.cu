@@ -1,5 +1,6 @@
 #include "fastllm-cuda.cuh"
 #include "activation_kernels.cuh"
+#include "layernorm_kernels.cuh"
 
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output)
 {
@@ -33,4 +34,8 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
 
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
     return sigmoid(input, output);
+}
+
+bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
+    return rms_norm(input, weight, output, eps);
 }
