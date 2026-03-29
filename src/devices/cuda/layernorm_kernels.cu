@@ -87,3 +87,49 @@ __global__ void rms_norm_kernel(
         v_out[i] = dst;
     }
 }
+
+void rms_norm(torch::Tensor &out,    // [..., hidden_size]
+              torch::Tensor &input,  // [..., hidden_size]
+              torch::Tensor &weight, // [hidden_size]
+              double epsilon)
+{
+    TORCH_CHECK(out.is_contiguous());
+    if (input.stride(-1) != 1)
+    {
+        input = input.contiguous();
+    }
+    TORCH_CHECK(input.stride(-1) == 1);
+    TORCH_CHECK(weight.is_contiguous());
+
+    int hidden_size = input.size(-1);
+
+    int num_tokens = input.numel() / hidden_size;
+    int num_dims = input.dim();
+    int64_t input_stride_d2 = input.stride(-2);
+    int64_t input_stride_d3 = (num_dims >= 3) ? input.stride(-3) : 0;
+    int64_t input_stride_d4 = (num_dims >= 4) ? input.stride(-4) : 0;
+    int64_t input_shape_d2 = (num_dims >= 3) ? input.size(-2) : 0;
+    int64_t input_shape_d3 = (num_dims >= 4) ? input.size(-3) : 0;
+
+    // For large num_tokens, use smaller blocks to increase SM concurrency.
+    const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+    dim3 grid(num_tokens);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    VLLM_DISPATCH_RANK234(num_dims, [&]
+                          { VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
+                                                         {
+      const int calculated_vec_size =
+          std::gcd(16 / sizeof(scalar_t), hidden_size);
+      const int block_size =
+          std::min(hidden_size / calculated_vec_size, max_block_size);
+      dim3 block(block_size);
+      VLLM_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
+        vllm::rms_norm_kernel<scalar_t, vec_size, tensor_rank>
+            <<<grid, block, 0, stream>>>(
+                out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
+                input_stride_d2, input_stride_d3, input_stride_d4,
+                input_shape_d2, input_shape_d3, weight.data_ptr<scalar_t>(),
+                epsilon, num_tokens, hidden_size);
+      }); }); });
+}
