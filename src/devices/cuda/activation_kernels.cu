@@ -2794,14 +2794,6 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
     return true;
 }
 
-bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
-    return silu_and_mul(input, output);
-}
-
-bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output) {
-    return cross_silu_and_mul(input, output);
-}
-
 bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
