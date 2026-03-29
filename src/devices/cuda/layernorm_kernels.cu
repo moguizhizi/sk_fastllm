@@ -1,3 +1,8 @@
+#include "type_convert.cuh"
+#include <cub/cub.cuh>
+#include "vectorization_utils.cuh"
+#include "cup_helpers.h"
+
 template <typename scalar_t, int VEC_SIZE, int NUM_DIMS>
 __global__ void rms_norm_kernel(
     scalar_t *__restrict__ out,          // [..., hidden_size]
@@ -51,7 +56,7 @@ __global__ void rms_norm_kernel(
         float x = static_cast<float>(val);
         variance += x * x;
     };
-    vllm::vectorize_read_with_alignment<VEC_SIZE>(
+    fastllm::vectorize_read_with_alignment<VEC_SIZE>(
         input_row, hidden_size, threadIdx.x, blockDim.x, vec_op, scalar_op);
 
     using BlockReduce = cub::BlockReduce<float, 1024>;
