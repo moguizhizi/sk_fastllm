@@ -142,56 +142,29 @@ __global__ void rms_norm_kernel(
     }
 }
 
-void rms_norm_(torch::Tensor &out,    // [..., hidden_size]
-              torch::Tensor &input,  // [..., hidden_size]
-              torch::Tensor &weight, // [hidden_size]
-              double epsilon) {
-    TORCH_CHECK(out.is_contiguous());
-    if (input.stride(-1) != 1)
-    {
-        input = input.contiguous();
-    }
-    TORCH_CHECK(input.stride(-1) == 1);
-    TORCH_CHECK(weight.is_contiguous());
+#define FASTLLM_LAUNCH_RMSNORM_KERNEL()                                                         \
+    FASTLLM_DISPATCH_RANK234(num_dims, [&] {                                                    \
+        FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {                                          \
+            const int calculated_vec_size = std::gcd(16 / sizeof(scalar_t), hidden_size);       \
+            const int block_size = std::min(hidden_size / calculated_vec_size, max_block_size); \
+            dim3 block(block_size);                                                             \
+                                                                                                \
+            FASTLLM_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {                                \
+                LAUNCH_KERNEL(rms_norm_kernel<scalar_t, vec_size, tensor_rank>                  \
+                    <<<grid, block>>>((scalar_t *)cudaOutput, (scalar_t *)cudaInput,            \
+                        input_stride_d2, input_stride_d3, input_stride_d4,                      \
+                        input_shape_d2, input_shape_d3, (scalar_t *)cudaWeight,                 \
+                        epsilon, num_tokens, hidden_size));                                     \
+            });                                                                                 \
+        });                                                                                     \
+    })
 
-    int hidden_size = input.size(-1);
-
-    int num_tokens = input.numel() / hidden_size;
-    int num_dims = input.dim();
-    int64_t input_stride_d2 = input.stride(-2);
-    int64_t input_stride_d3 = (num_dims >= 3) ? input.stride(-3) : 0;
-    int64_t input_stride_d4 = (num_dims >= 4) ? input.stride(-4) : 0;
-    int64_t input_shape_d2 = (num_dims >= 3) ? input.size(-2) : 0;
-    int64_t input_shape_d3 = (num_dims >= 4) ? input.size(-3) : 0;
-
-    // For large num_tokens, use smaller blocks to increase SM concurrency.
-    const int max_block_size = (num_tokens < 256) ? 1024 : 256;
-    dim3 grid(num_tokens);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    FASTLLM_DISPATCH_RANK234(num_dims, [&]
-                          { VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
-                                                         {
-      const int calculated_vec_size =
-          std::gcd(16 / sizeof(scalar_t), hidden_size);
-      const int block_size =
-          std::min(hidden_size / calculated_vec_size, max_block_size);
-      dim3 block(block_size);
-      FASTLLM_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
-        vllm::rms_norm_kernel<scalar_t, vec_size, tensor_rank>
-            <<<grid, block, 0, stream>>>(
-                out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                input_stride_d2, input_stride_d3, input_stride_d4,
-                input_shape_d2, input_shape_d3, weight.data_ptr<scalar_t>(),
-                epsilon, num_tokens, hidden_size);
-      }); }); });
-}
-
-#define FASTLLM_RMSNORM_BODY(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                           \
+#define FASTLLM_RMSNORM_BODY()                                                           \
     int input_len = input.Count(0);                                                      \
     int output_len = output.Count(0);                                                    \
                                                                                          \
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);                          \
+    float *cudaWeight = (float *)FastllmCudaPrepareInput(weight);                        \
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);                       \
                                                                                          \
     int hidden_size = input.Count(input.dims.size() - 1);                                \
@@ -220,15 +193,18 @@ void rms_norm_(torch::Tensor &out,    // [..., hidden_size]
     axis = (axis % num_dims + num_dims) % num_dims;                                      \
     int64_t input_shape_d3 = (num_dims >= 4) ? input.dims[axis] : 0;                     \
                                                                                          \
-    dim3 grid(num_tokens);                                                               \
-    dim3 block(vec_config.block_size);                                                   \
+    const int max_block_size = (num_tokens < 256) ? 1024 : 256;                          \
                                                                                          \
-    FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL(ACT_FN, PACKED_ACT_FN, ACT_FIRST);             \
+    dim3 grid(num_tokens);                                                               \
+                                                                                         \
+    FASTLLM_LAUNCH_RMSNORM_KERNEL();                                             \
                                                                                          \
     FastllmCudaFinishInput(input, cudaInput);                                            \
     FastllmCudaFinishOutput(output, cudaOutput);                                         \
     return true;
 
 bool rms_norm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
-    return false;
+    int axis = 0;
+    const float epsilon = eps;
+    FASTLLM_RMSNORM_BODY();
 }
