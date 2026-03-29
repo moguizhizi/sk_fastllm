@@ -2,6 +2,53 @@
 #include <cub/cub.cuh>
 #include "vectorization_utils.cuh"
 #include "cup_helpers.h"
+#include <torch/all.h>
+#include <torch/extension.h>
+
+#define LAUNCH_KERNEL(...) __VA_ARGS__
+
+#define FASTLLM_DISPATCH_RANK234(NUM_DIMS, ...)                                \
+  switch (NUM_DIMS) {                                                          \
+    case 2: {                                                                  \
+      constexpr int tensor_rank = 2;                                           \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 3: {                                                                  \
+      constexpr int tensor_rank = 3;                                           \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 4: {                                                                  \
+      constexpr int tensor_rank = 4;                                           \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    default:                                                                   \
+      TORCH_CHECK(false, "Expects rank 2, 3 or 4 tensors but got ", NUM_DIMS); \
+  }
+
+#define FASTLLM_DISPATCH_FLOAT_TYPES(TYPE, BODY) \
+    switch (TYPE) {                              \
+        case fastllm::DataType::FLOAT32: {       \
+            using scalar_t = float;              \
+            using packed_t = float2;             \
+            BODY;                                \
+            break;                               \
+        }                                        \
+        case fastllm::DataType::FLOAT16: {       \
+            using scalar_t = half;               \
+            using packed_t = __half2;            \
+            BODY;                                \
+            break;                               \
+        }                                        \
+        case fastllm::DataType::BFLOAT16: {      \
+            using scalar_t = __nv_bfloat16;      \
+            using packed_t = __nv_bfloat162;     \
+            BODY;                                \
+            break;                               \
+        }                                        \
+    }
 
 template <typename scalar_t, int VEC_SIZE, int NUM_DIMS>
 __global__ void rms_norm_kernel(
@@ -88,11 +135,10 @@ __global__ void rms_norm_kernel(
     }
 }
 
-void rms_norm(torch::Tensor &out,    // [..., hidden_size]
+void rms_norm_(torch::Tensor &out,    // [..., hidden_size]
               torch::Tensor &input,  // [..., hidden_size]
               torch::Tensor &weight, // [hidden_size]
-              double epsilon)
-{
+              double epsilon) {
     TORCH_CHECK(out.is_contiguous());
     if (input.stride(-1) != 1)
     {
@@ -116,7 +162,7 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
     dim3 grid(num_tokens);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    VLLM_DISPATCH_RANK234(num_dims, [&]
+    FASTLLM_DISPATCH_RANK234(num_dims, [&]
                           { VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
                                                          {
       const int calculated_vec_size =
@@ -132,4 +178,50 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
                 input_shape_d2, input_shape_d3, weight.data_ptr<scalar_t>(),
                 epsilon, num_tokens, hidden_size);
       }); }); });
+}
+
+#define FASTLLM_RMSNORM_BODY(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                           \
+    int input_len = input.Count(0);                                                      \
+    int output_len = output.Count(0);                                                    \
+                                                                                         \
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);                          \
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);                       \
+                                                                                         \
+    int hidden_size = input.Count(input.dims.size() - 1);                                \
+                                                                                         \
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];                      \
+    int num_dims = input.dims.size();                                                    \
+                                                                                         \
+    axis = -2;                                                                           \
+    axis = (axis % num_dims + num_dims) % num_dims;                                      \
+    int64_t input_stride_d2 = input.strides[axis];                                       \
+                                                                                         \
+    axis = -3;                                                                           \
+    axis = (axis % num_dims + num_dims) % num_dims;                                      \
+    int64_t input_stride_d3 = (num_dims >= 3) ? input.strides[axis] : 0;                 \
+                                                                                         \
+    axis = -4;                                                                           \
+    axis = (axis % num_dims + num_dims) % num_dims;                                      \
+    int64_t input_stride_d4 = (num_dims >= 4) ? input.strides[axis] : 0;                 \
+                                                                                         \
+                                                                                         \
+    axis = -2;                                                                           \
+    axis = (axis % num_dims + num_dims) % num_dims;                                      \
+    int64_t input_shape_d2 = (num_dims >= 3) ? input.dims[axis] : 0;                     \
+                                                                                         \
+    axis = -3;                                                                           \
+    axis = (axis % num_dims + num_dims) % num_dims;                                      \
+    int64_t input_shape_d3 = (num_dims >= 4) ? input.dims[axis] : 0;                     \
+                                                                                         \
+    dim3 grid(num_tokens);                                                               \
+    dim3 block(vec_config.block_size);                                                   \
+                                                                                         \
+    FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL(ACT_FN, PACKED_ACT_FN, ACT_FIRST);             \
+                                                                                         \
+    FastllmCudaFinishInput(input, cudaInput);                                            \
+    FastllmCudaFinishOutput(output, cudaOutput);                                         \
+    return true;
+
+bool rms_norm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
+    return false;
 }
