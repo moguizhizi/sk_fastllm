@@ -76,3 +76,13 @@ __device__ inline void vectorize_read_with_alignment(const InT *in, int len,
         scalar_op(in[i]);
     }
 }
+
+// overload that requires only a scalar_op
+template <int VEC_SIZE, typename InT, typename ScaOp>
+__device__ __forceinline__ void vectorize_read_with_alignment(
+    const InT *in, int len, int tid, int stride, ScaOp &&scalar_op)
+{
+    using Vec = DefaultReadVecOp<VEC_SIZE, InT, std::decay_t<ScaOp>>;
+    vectorize_read_with_alignment<VEC_SIZE>(in, len, tid, stride, Vec{scalar_op},
+                                            std::forward<ScaOp>(scalar_op));
+}
