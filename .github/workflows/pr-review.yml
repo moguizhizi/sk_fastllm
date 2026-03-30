@@ -1,0 +1,155 @@
+name: PR Auto Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build review summary
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python <<'PY2'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          base = os.environ['PR_BASE_SHA']
+          head = os.environ['PR_HEAD_SHA']
+
+          def run(*args):
+              return subprocess.check_output(args, text=True)
+
+          files_raw = run('git', 'diff', '--name-only', f'{base}...{head}')
+          files = [line.strip() for line in files_raw.splitlines() if line.strip()]
+
+          diff_text = run('git', 'diff', '--unified=0', f'{base}...{head}')
+          added_lines = []
+          current_file = None
+          current_line = 0
+
+          for raw_line in diff_text.splitlines():
+              if raw_line.startswith('+++ b/'):
+                  current_file = raw_line[6:]
+                  continue
+              if raw_line.startswith('@@ '):
+                  m = re.search(r'\+(\d+)', raw_line)
+                  current_line = int(m.group(1)) if m else 0
+                  continue
+              if raw_line.startswith('+') and not raw_line.startswith('+++'):
+                  added_lines.append((current_file, current_line, raw_line[1:]))
+                  current_line += 1
+              elif raw_line.startswith('-') and not raw_line.startswith('---'):
+                  continue
+              else:
+                  if current_line:
+                      current_line += 1
+
+          checks = [
+              ('TODO/FIXME/HACK', re.compile(r'\b(TODO|FIXME|HACK|XXX)\b')),
+              ('debug print', re.compile(r'\b(printk?|printf|std::cout|std::cerr|console\.log|dbg!|System\.out\.println)\b')),
+              ('assert/abort style debug', re.compile(r'\b(assert|abort\s*\()')),
+          ]
+
+          findings = []
+          for label, pattern in checks:
+              for file_path, line_no, content in added_lines:
+                  if pattern.search(content):
+                      findings.append((label, file_path, line_no, content.strip()))
+
+          ext_counter = {}
+          for file_path in files:
+              suffix = Path(file_path).suffix or '[no extension]'
+              ext_counter[suffix] = ext_counter.get(suffix, 0) + 1
+
+          lines = []
+          lines.append('<!-- fastllm-pr-auto-review -->')
+          lines.append('## PR Auto Review')
+          lines.append('')
+          lines.append('这是基于 diff 的自动检查摘要，主要用于快速发现明显风险，不替代人工 review。')
+          lines.append('')
+          lines.append(f'- 变更文件数: {len(files)}')
+          lines.append(f'- 检查范围: `{base[:7]}...{head[:7]}`')
+
+          if ext_counter:
+              summary = ', '.join(f'`{k}` x {v}' for k, v in sorted(ext_counter.items()))
+              lines.append(f'- 文件类型分布: {summary}')
+
+          lines.append('')
+          if findings:
+              lines.append('### Findings')
+              lines.append('')
+              for label, file_path, line_no, content in findings[:20]:
+                  safe = content.replace('`', '\`')
+                  lines.append(f'- `{label}` at `{file_path}:{line_no}`: `{safe}`')
+              if len(findings) > 20:
+                  lines.append(f'- 其余 {len(findings) - 20} 条结果已省略')
+          else:
+              lines.append('### Findings')
+              lines.append('')
+              lines.append('- 未发现基于当前规则的明显告警')
+
+          lines.append('')
+          lines.append('### Notes')
+          lines.append('')
+          lines.append('- 当前规则会重点检查新增行中的 TODO/FIXME/HACK、调试输出和显式断言/中止调用')
+          lines.append('- 如果需要，我建议后续继续补静态检查、单元测试和更细的语言级规则')
+
+          Path('pr-review-report.md').write_text('\n'.join(lines) + '\n')
+          PY2
+
+      - name: Create or update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('pr-review-report.md', 'utf8');
+            const marker = '<!-- fastllm-pr-auto-review -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(comment =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
