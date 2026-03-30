@@ -56,6 +56,64 @@
         }                                           \
     }
 
+/* Function specialization in the case of FP16/BF16 tensors.
+   Additional optimizations we can make in this case are
+   packed and vectorized operations, which help with the
+   memory latency bottleneck. */
+template <typename scalar_t, int width>
+__global__ std::enable_if_t<(width > 0) && _typeConvert<scalar_t>::exists>
+fused_add_rms_norm_kernel(
+    scalar_t* __restrict__ input,  // [..., hidden_size]
+    const int64_t input_stride,
+    scalar_t* __restrict__ residual,      // [..., hidden_size]
+    const scalar_t* __restrict__ weight,  // [hidden_size]
+    const float epsilon, const int num_tokens, const int hidden_size) {
+  // Sanity checks on our vector struct and type-punned pointer arithmetic
+  static_assert(std::is_pod_v<_f16Vec<scalar_t, width>>);
+  static_assert(sizeof(_f16Vec<scalar_t, width>) == sizeof(scalar_t) * width);
+
+  const int vec_hidden_size = hidden_size / width;
+  const int64_t vec_input_stride = input_stride / width;
+  __shared__ float s_variance;
+  float variance = 0.0f;
+  /* These and the argument pointers are all declared `restrict` as they are
+     not aliased in practice. Argument pointers should not be dereferenced
+     in this kernel as that would be undefined behavior */
+  auto* __restrict__ input_v =
+      reinterpret_cast<_f16Vec<scalar_t, width>*>(input);
+  auto* __restrict__ residual_v =
+      reinterpret_cast<_f16Vec<scalar_t, width>*>(residual);
+  auto* __restrict__ weight_v =
+      reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
+
+  for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+    int id = blockIdx.x * vec_hidden_size + idx;
+    int64_t strided_id = blockIdx.x * vec_input_stride + idx;
+    _f16Vec<scalar_t, width> temp = input_v[strided_id];
+    temp += residual_v[id];
+    variance += temp.sum_squares();
+    residual_v[id] = temp;
+  }
+
+  using BlockReduce = cub::BlockReduce<float, 1024>;
+  __shared__ typename BlockReduce::TempStorage reduceStore;
+  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
+
+  if (threadIdx.x == 0) {
+    s_variance = rsqrtf(variance / hidden_size + epsilon);
+  }
+  __syncthreads();
+
+  for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+    int id = blockIdx.x * vec_hidden_size + idx;
+    int64_t strided_id = blockIdx.x * vec_input_stride + idx;
+    _f16Vec<scalar_t, width> temp = residual_v[id];
+    temp *= s_variance;
+    temp *= weight_v[idx];
+    input_v[strided_id] = temp;
+  }
+}
+
 
 template <typename scalar_t, int VEC_SIZE, int NUM_DIMS>
 __global__ void rms_norm_kernel(
