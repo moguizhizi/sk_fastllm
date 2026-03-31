@@ -2,12 +2,12 @@
 
 #include <torch/all.h>
 
-#ifdef USE_ROCM
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#ifndef USE_ROCM
+  #include <cuda_bf16.h>
+  #include <cuda_fp16.h>
 #else
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp16.h>
+  #include <hip/hip_bf16.h>
+  #include <hip/hip_fp16.h>
 
 using __nv_bfloat16 = __hip_bfloat16;
 using __nv_bfloat162 = __hip_bfloat162;
