@@ -39,3 +39,7 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
     return rms_norm(input, weight, output, eps);
 }
+
+bool FastllmCudaFusedAddRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
+    return fused_add_rms_norm(input, weight, output, eps);
+}

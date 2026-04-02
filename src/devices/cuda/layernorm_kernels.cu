@@ -3,6 +3,7 @@
 
 #include <cub/cub.cuh>
 
+#include "batch_invariant.hpp"
 #include "cup_helpers.h"
 #include "kernel_macros.cuh"
 #include "type_convert.cuh"
@@ -232,6 +233,14 @@ __global__ void rms_norm_kernel(scalar_t *__restrict__ out, // [..., hidden_size
         });                                                                                                                                    \
     })
 
+#define LAUNCH_FUSED_ADD_RMS_NORM(width)                                                         \
+  FASTLLM_DISPATCH_FLOAT_TYPES(                                             \
+      input.dataType, LAUNCH_KERNEL(fused_add_rms_norm_kernel<scalar_t, width><<<grid, block>>>(                                   \
+                (scalar_t *)cudaInput, input_stride,                   \
+                (scalar_t *)cudaResidual, (scalar_t *)cudaWeight, \
+                epsilon, num_tokens, hidden_size);                          \
+      );
+
 #define FASTLLM_RMSNORM_BODY()                                           \
     int input_len = input.Count(0);                                      \
     int output_len = output.Count(0);                                    \
@@ -279,4 +288,53 @@ bool rms_norm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &
     int axis = 0;
     const float epsilon = eps;
     FASTLLM_RMSNORM_BODY();
+}
+
+bool fused_add_rms_norm( // [hidden_size]
+    const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output, double epsilon) {
+    TORCH_CHECK(weight.dataType == input.dataType);
+    TORCH_CHECK(input.dataType == residual.dataType);
+
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    float *cudaWeight = (float *)FastllmCudaPrepareInput(weight);
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+
+    int hidden_size = input.Count(input.dims.size() - 1);
+    int64_t input_stride = hidden_size; // Assuming the last dimension is contiguous
+
+    int num_tokens = input_len / input.dims[input.dims.size() - 1];
+
+    dim3 grid(num_tokens);
+    /* This kernel is memory-latency bound in many scenarios.
+       When num_tokens is large, a smaller block size allows
+       for increased block occupancy on CUs and better latency
+       hiding on global mem ops. */
+    const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+    dim3 block(std::min(hidden_size, max_block_size));
+    /*If the tensor types are FP16/BF16, try to use the optimized kernel
+      with packed + vectorized ops.
+      Max optimization is achieved with a width-8 vector of FP16/BF16s
+      since we can load at most 128 bits at once in a global memory op.
+      However, this requires each tensor's data to be aligned to 16
+      bytes.
+     */
+    auto inp_ptr = reinterpret_cast<std::uintptr_t>(cudaInput);
+    auto res_ptr = reinterpret_cast<std::uintptr_t>(cudaResidual);
+    auto wt_ptr = reinterpret_cast<std::uintptr_t>(cudaWeight);
+    constexpr int vector_width = 8;
+    constexpr int req_alignment_bytes = vector_width * 2; // vector_width * sizeof(bfloat16 or float16) (float32
+                                                          // falls back to non-vectorized version anyway)
+    bool ptrs_are_aligned = inp_ptr % req_alignment_bytes == 0 && res_ptr % req_alignment_bytes == 0 && wt_ptr % req_alignment_bytes == 0;
+    bool offsets_are_multiple_of_vector_width = hidden_size % vector_width == 0 && input_stride % vector_width == 0;
+    bool batch_invariant_launch = FastLLM::FastLLM_is_batch_invariant();
+    if (ptrs_are_aligned && offsets_are_multiple_of_vector_width && !batch_invariant_launch) {
+        LAUNCH_FUSED_ADD_RMS_NORM(8);
+    } else {
+        LAUNCH_FUSED_ADD_RMS_NORM(0);
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+
+    return true;
 }
