@@ -288,6 +288,24 @@ namespace fastllm {
         NONE = 0, LINEAR = 1, EMBEDDING = 2, CONV2D = 3, CONV1D = 4, AUTO = 99999
     };
 
+    enum TensorParallelLayoutType {
+        TP_LAYOUT_NONE = 0,       // 不使用 tensor parallel 布局，按普通单份张量处理
+        TP_LAYOUT_REPLICATED = 1, // 多卡各持有一份完整副本
+        TP_LAYOUT_SHARDED = 2     // 多卡沿 tpAxis 切分，每卡只持有部分数据
+    };
+
+    enum TensorParallelLinearType {
+        TP_LINEAR_NONE = 0,
+        TP_LINEAR_ROW = 1,
+        TP_LINEAR_COLUMN = 2
+    };
+
+    enum TensorParallelPackType {
+        TP_PACK_NONE = 0,
+        TP_PACK_GATEUP = 1,
+        TP_PACK_QKV = 2
+    };
+
     struct FileMmap {
     public:
         FileMmap(const std::string &path);
@@ -392,6 +410,16 @@ namespace fastllm {
         bool multiDeviceData = false;
         std::map <int, Data*> multiDeviceDatas;
 
+        TensorParallelLayoutType tpLayout = TP_LAYOUT_NONE;
+        int tpAxis = -1;
+        std::vector <int> tpGlobalDims;
+        std::map <int, std::vector <std::pair <int, int> > > tpRanges;
+        TensorParallelLinearType tpLinearType = TP_LINEAR_NONE;
+        TensorParallelPackType tpPackType = TP_PACK_NONE;
+        int tpQHeads = 0;
+        int tpKVHeads = 0;
+        int tpHeadDim = 0;
+
         int weightId;
         bool isRegistered = false;
 
@@ -434,11 +462,13 @@ namespace fastllm {
 
         void Allocate(); // 分配内存
 
+        void Allocate(bool zero); // 分配内存，zero=false 时跳过清零
+
         void Allocate(float v); // 分配内存并初始化
 
         void Expansion(const std::vector <int> &dims); // 预扩容到相应尺寸
 
-        void MallocSpace(uint64_t size); // 在设备上分配
+        void MallocSpace(uint64_t size, bool zero = true); // 在设备上分配
 
         void FreeSpace(); // 回收设备上的内存
 
@@ -490,6 +520,12 @@ namespace fastllm {
 
         // 当前权重作为linear的weight时，输入应该是什么类型
         DataType GetLinearActDataType(int batchSize);
+
+        bool IsTensorParallel() const;
+        bool IsTensorParallelReplicated() const;
+        bool IsTensorParallelSharded() const;
+        void ClearTensorParallelLayout();
+        void ResetMultiDeviceState();
     };
 
     struct CacheTrieNode {

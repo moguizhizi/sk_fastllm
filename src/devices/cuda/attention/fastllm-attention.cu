@@ -18,6 +18,8 @@
 
 #include <cstdlib>
 #include <cuda_fp8.h>
+#include <map>
+#include <mutex>
 
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
@@ -2121,10 +2123,12 @@ struct FlashInferWorkSpaceManager {
 };
 
 static std::map<int, std::unique_ptr<FlashInferWorkSpaceManager>> s_fastllmFlashInferWorkSpaceMap;
+static std::mutex s_fastllmFlashInferWorkSpaceMapLock;
 
 FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     int id = -1;
     cudaGetDevice(&id);
+    std::lock_guard<std::mutex> guard(s_fastllmFlashInferWorkSpaceMapLock);
     auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
     if (it != s_fastllmFlashInferWorkSpaceMap.end()) {
         return *it->second;
@@ -2348,15 +2352,14 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         cudaMemcpy(q_indptr_gpu, q_indptr_host.data(), (batch_size + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
         uint32_t total_num_rows = q_indptr_host[batch_size];
-        static PrefillPlanInfo plan_info;
-        static int last_plan_device_id = -1;
+        thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
+        thread_local static std::map<int, bool> plan_inited_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
-        bool device_changed = (current_device_id != last_plan_device_id);
-        if (!inited || device_changed) {
+        if (!inited || !plan_inited_map[current_device_id]) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-                workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
+                workspace.int_workspace_size, plan_info_map[current_device_id], q_indptr_host.data(), indptr_host.data(), 
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
                 pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
                 /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
@@ -2368,8 +2371,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
                 FastllmCudaFree(q_indptr_gpu);
                 exit(0);
             }
-            last_plan_device_id = current_device_id;
+            plan_inited_map[current_device_id] = true;
         }
+        PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
@@ -2452,7 +2456,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     return true;
 }
 
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited) {
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync) {
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     
@@ -2563,15 +2567,14 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
         cudaStream_t stream = nullptr;
-        static PrefillPlanInfo plan_info;
-        static int last_plan_device_id = -1;
+        thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
+        thread_local static std::map<int, bool> plan_inited_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
-        bool device_changed = (current_device_id != last_plan_device_id);
-        if (!inited || device_changed) {
+        if (!inited || !plan_inited_map[current_device_id]) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-                workspace.int_workspace_size, plan_info, 
+                workspace.int_workspace_size, plan_info_map[current_device_id], 
                 (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
                 pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
@@ -2583,8 +2586,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                 cudaStreamSynchronize(stream);
                 exit(0);
             }
-            last_plan_device_id = current_device_id;
+            plan_inited_map[current_device_id] = true;
         }
+        PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
@@ -2650,7 +2654,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 // 避免在 CUDA 侧再做 Permute，由调用方按需做一次 Reshape + Permute 即可得到 [bsz, seqlen, embed_dim]
 ((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
     
-    DeviceSync();
+    if (sync) {
+        DeviceSync();
+    }
     return true;
 }
 
