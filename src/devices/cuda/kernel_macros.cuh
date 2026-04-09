@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <torch/all.h>
+#include "fastllm.h"
+
 #define LAUNCH_KERNEL(...) __VA_ARGS__
 
 #define FASTLLM_DISPATCH_FLOAT_TYPES(TYPE, BODY) \
@@ -22,4 +27,14 @@
             BODY;                                \
             break;                               \
         }                                        \
+    }
+
+#define FASTLLM_DISPATCH_FP8_TYPES(TYPE, BODY)   \
+    switch (TYPE) {                              \
+        case fastllm::DataType::FP8_E4M3: {      \
+            using fp8_t = c10::Float8_e4m3fn;    \
+            BODY;                                \
+            break;                               \
+        }                                        \
+                                                 \
     }
