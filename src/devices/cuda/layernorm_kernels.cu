@@ -302,6 +302,7 @@ bool fused_add_rms_norm( // [hidden_size]
     int hidden_size = input.Count(input.dims.size() - 1);
     int64_t input_stride = hidden_size; // Assuming the last dimension is contiguous
 
+    int input_len = input.Count(0);    
     int num_tokens = input_len / input.dims[input.dims.size() - 1];
 
     dim3 grid(num_tokens);
