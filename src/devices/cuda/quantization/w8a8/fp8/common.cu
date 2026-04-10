@@ -120,7 +120,7 @@ bool dynamic_scaled_fp8_quant(const fastllm::Data &input, fastllm::Data &output,
     return true;
 }
 
-void dynamic_per_token_scaled_fp8_quant(
+bool dynamic_per_token_scaled_fp8_quant(
     const fastllm::Data &input, fastllm::Data &output, fastllm::Data &scale, std::optional<float> const &scale_ub) {
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
@@ -147,4 +147,6 @@ void dynamic_per_token_scaled_fp8_quant(
                 (scalar_t *)cudaInput, scale_ub.has_value() ? scale_ub_val, has_scale_ub, hidden_size, in_row_stride, out_row_stride);
         });
     });
+
+    return true;
 }
