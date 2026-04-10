@@ -88,10 +88,11 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type *__re
     });
 }
 
-bool dynamic_scaled_fp8_quant(float *scale, const fastllm::Data &input,
-    fastllm::Data &output) // [1]
+bool dynamic_scaled_fp8_quant(const fastllm::Data &input,
+    fastllm::Data &output, fastllm::Data &scale) // [1]
 {
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
 
     const int hidden_size = input.Count(input.dims.size() - 1);
@@ -109,10 +110,10 @@ bool dynamic_scaled_fp8_quant(float *scale, const fastllm::Data &input,
     FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
         FASTLLM_DISPATCH_FP8_TYPES(output.dataType, {
             segmented_max_reduction_strided<scalar_t, fp8_t>
-                <<<grid, block>>>(scale, (scalar_t *)cudaInput, hidden_size, in_row_stride, static_cast<int64_t>(num_tokens));
+                <<<grid, block>>>(cudaScale, (scalar_t *)cudaInput, hidden_size, in_row_stride, static_cast<int64_t>(num_tokens));
 
             scaled_fp8_quant_kernel_strided_dynamic<scalar_t, fp8_t>
-                <<<grid, block>>>((fp8_t *)cudaOutput, (scalar_t *)cudaInput, scale, hidden_size, in_row_stride, out_row_stride);
+                <<<grid, block>>>((fp8_t *)cudaOutput, (scalar_t *)cudaInput, cudaScale, hidden_size, in_row_stride, out_row_stride);
         });
     });
 
