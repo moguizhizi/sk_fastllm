@@ -53,6 +53,41 @@ __global__ void scaled_fp8_quant_kernel_strided_dynamic(fp8_type *__restrict__ o
     });
 }
 
+template <typename scalar_t, typename fp8_type>
+__global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type *__restrict__ out, float *__restrict__ scale,
+    const scalar_t *__restrict__ input, const float *__restrict__ scale_ub, int hidden_size, int64_t in_row_stride, int64_t out_row_stride) {
+    const int64_t token_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    // Use int64 to avoid overflowing an int32 when calculating this offset
+    int64_t in_offset = static_cast<int64_t>(token_idx) * in_row_stride;
+    int64_t out_offset = static_cast<int64_t>(token_idx) * out_row_stride;
+    const scalar_t *token_in = input + in_offset;
+    fp8_type *token_out = out + out_offset;
+
+    // 1) per-token absmax
+    float absmax_val = 0.f;
+    vectorize_read_with_alignment<16>(
+        token_in, hidden_size, tid, blockDim.x, [&] __device__(scalar_t v) { absmax_val = fmaxf(absmax_val, fabsf(static_cast<float>(v))); });
+
+    using BlockReduce = cub::BlockReduce<float, 256>;
+    __shared__ typename BlockReduce::TempStorage tmp;
+    const float block_max = BlockReduce(tmp).Reduce(absmax_val, CubMaxOp{}, blockDim.x);
+
+    __shared__ float token_scale;
+    if (tid == 0) {
+        token_scale = scale_ub ? fminf(block_max, *scale_ub) : block_max;
+        token_scale = fmaxf(token_scale / quant_type_max_v<fp8_type>, min_scaling_factor<fp8_type>::val());
+        scale[token_idx] = token_scale;
+    }
+    __syncthreads();
+
+    // 2) quantize
+    vectorize_with_alignment<16>(token_in, token_out, hidden_size, tid, blockDim.x, [=] __device__(fp8_type & dst, const scalar_t &src) {
+        dst = scaled_fp8_conversion<false, fp8_type>(static_cast<float>(src), token_scale);
+    });
+}
+
 bool dynamic_scaled_fp8_quant(float *scale, const fastllm::Data &input,
     fastllm::Data &output) // [1]
 {
@@ -74,14 +109,10 @@ bool dynamic_scaled_fp8_quant(float *scale, const fastllm::Data &input,
     FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
         FASTLLM_DISPATCH_FP8_TYPES(output.dataType, {
             segmented_max_reduction_strided<scalar_t, fp8_t>
-                <<<grid, block>>>(scale, (scalar_t *)cudaInput, hidden_size,
-                                  in_row_stride,
-                                  static_cast<int64_t>(num_tokens));
+                <<<grid, block>>>(scale, (scalar_t *)cudaInput, hidden_size, in_row_stride, static_cast<int64_t>(num_tokens));
 
             scaled_fp8_quant_kernel_strided_dynamic<scalar_t, fp8_t>
-                <<<grid, block>>>((fp8_t *)cudaOutput, (scalar_t *)cudaInput,
-                                  scale, hidden_size, in_row_stride,
-                                  out_row_stride);
+                <<<grid, block>>>((fp8_t *)cudaOutput, (scalar_t *)cudaInput, scale, hidden_size, in_row_stride, out_row_stride);
         });
     });
 
