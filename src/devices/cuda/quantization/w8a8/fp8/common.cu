@@ -55,7 +55,8 @@ __global__ void scaled_fp8_quant_kernel_strided_dynamic(fp8_type *__restrict__ o
 
 template <typename scalar_t, typename fp8_type>
 __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type *__restrict__ out, float *__restrict__ scale,
-    const scalar_t *__restrict__ input, const float *__restrict__ scale_ub, int hidden_size, int64_t in_row_stride, int64_t out_row_stride) {
+    const scalar_t *__restrict__ input, const float &scale_ub, const bool has_scale_ub, int hidden_size, int64_t in_row_stride,
+    int64_t out_row_stride) {
     const int64_t token_idx = blockIdx.x;
     const int tid = threadIdx.x;
 
@@ -76,7 +77,7 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type *__re
 
     __shared__ float token_scale;
     if (tid == 0) {
-        token_scale = scale_ub ? fminf(block_max, *scale_ub) : block_max;
+        token_scale = has_scale_ub ? fminf(block_max, scale_ub) : block_max;
         token_scale = fmaxf(token_scale / quant_type_max_v<fp8_type>, min_scaling_factor<fp8_type>::val());
         scale[token_idx] = token_scale;
     }
@@ -88,8 +89,7 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(fp8_type *__re
     });
 }
 
-bool dynamic_scaled_fp8_quant(const fastllm::Data &input,
-    fastllm::Data &output, fastllm::Data &scale) // [1]
+bool dynamic_scaled_fp8_quant(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &scale) // [1]
 {
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
@@ -118,4 +118,33 @@ bool dynamic_scaled_fp8_quant(const fastllm::Data &input,
     });
 
     return true;
+}
+
+void dynamic_per_token_scaled_fp8_quant(
+    const fastllm::Data &input, fastllm::Data &output, fastllm::Data &scale, std::optional<float> const &scale_ub) {
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+
+    const int hidden_size = input.Count(input.dims.size() - 1);
+    const int input_len = input.Count(0);
+
+    const int num_tokens = input_len / input.dims[input.dims.size() - 1];
+    const int block_size = 256;
+
+    dim3 grid(num_tokens);
+    dim3 block(std::min(hidden_size, block_size));
+
+    const int64_t in_row_stride = hidden_size;
+    const int64_t out_row_stride = hidden_size;
+
+    float scale_ub_val = scale_ub.value_or(0.0f);
+    bool has_scale_ub = scale_ub.has_value();
+
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
+        FASTLLM_DISPATCH_FP8_TYPES(output.dataType, {
+            dynamic_per_token_scaled_fp8_quant_kernel_strided<scalar_t, fp8_t><<<grid, block>>>((fp8_t *)cudaOutput, cudaScale,
+                (scalar_t *)cudaInput, scale_ub.has_value() ? scale_ub_val, has_scale_ub, hidden_size, in_row_stride, out_row_stride);
+        });
+    });
 }
