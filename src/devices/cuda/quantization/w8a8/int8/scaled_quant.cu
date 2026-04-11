@@ -91,13 +91,12 @@ static inline __device__ int8_t int32_to_int8(int32_t x) {
 #endif
 }
 
-template <typename scalar_t, typename scale_t>
+template <typename scalar_t>
 __global__ void static_scaled_int8_quant_kernel(
-    const scalar_t *__restrict__ input, int8_t *__restrict__ output, const scale_t *scale_ptr, const int hidden_size) {
+    const scalar_t *__restrict__ input, int8_t *__restrict__ output, const float scale, const int hidden_size) {
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
     const int64_t token_idx = blockIdx.x;
-    const float scale = *scale_ptr;
 
     // Must be performed using 64-bit math to avoid integer overflow.
     const scalar_t *row_in = input + token_idx * hidden_size;
@@ -107,25 +106,52 @@ __global__ void static_scaled_int8_quant_kernel(
         [=] __device__(int8_t &dst, const scalar_t &src) { dst = float_to_int8_rn(static_cast<float>(src) / scale); });
 }
 
-template <typename scalar_t, typename scale_t, typename azp_t>
+template <typename scalar_t, typename azp_t>
 __global__ void static_scaled_int8_azp_quant_kernel(
-    const scalar_t* __restrict__ input, int8_t* __restrict__ output,
-    const scale_t* scale_ptr, const azp_t* azp_ptr, const int hidden_size) {
-  const int tid = threadIdx.x;
-  const int stride = blockDim.x;
-  const int64_t token_idx = blockIdx.x;
-  const float scale = *scale_ptr;
-  const azp_t azp = *azp_ptr;
-  const float inv_s = 1.0f / scale;
+    const scalar_t *__restrict__ input, int8_t *__restrict__ output, const float scale, const azp_t azp, const int hidden_size) {
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int64_t token_idx = blockIdx.x;
+    const float inv_s = 1.0f / scale;
 
-  // Must be performed using 64-bit math to avoid integer overflow.
-  const scalar_t* row_in = input + token_idx * hidden_size;
-  int8_t* row_out = output + token_idx * hidden_size;
+    // Must be performed using 64-bit math to avoid integer overflow.
+    const scalar_t *row_in = input + token_idx * hidden_size;
+    int8_t *row_out = output + token_idx * hidden_size;
 
-  vectorize_with_alignment<16>(
-      row_in, row_out, hidden_size, tid, stride,
-      [=] __device__(int8_t& dst, const scalar_t& src) {
+    vectorize_with_alignment<16>(row_in, row_out, hidden_size, tid, stride, [=] __device__(int8_t &dst, const scalar_t &src) {
         const auto v = static_cast<float>(src) * inv_s;
         dst = int32_to_int8(float_to_int32_rn(v) + azp);
-      });
+    });
+}
+
+bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output, const float scale, std::optional<fastllm::Data> const &azp) {
+    TORCH_CHECK(!azp || azp.Count(0) == 1);
+
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    if (azp.has_value()) {
+        float *cudaazp = (float *)FastllmCudaPrepareInput(azp);
+    }
+
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+
+    int input_num_dims = input.dims.size();
+    int axis = -1;
+    axis = (axis % input_num_dims + input_num_dims) % input_num_dims;
+
+    int const hidden_size = input.dims[axis];
+    int const num_tokens = input.Count(0) / hidden_size;
+
+    dim3 const grid(num_tokens);
+    dim3 const block(std::min(hidden_size, 256));
+
+    FASTLLM_DISPATCH_FLOATING_TYPES(input.dataType, {
+        if (!azp.has_value()) {
+            static_scaled_int8_quant_kernel<scalar_t><<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, scale, hidden_size);
+        } else {
+            static_scaled_int8_azp_quant_kernel<scalar_t, int32_t>
+                <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, scale, (int32_t *)cudaazp, hidden_size);
+        }
+    });
+
+    return true;
 }
