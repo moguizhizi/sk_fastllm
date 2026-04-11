@@ -14,6 +14,19 @@ import sys
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
+    from .gemma4_multimodal import (
+        build_gemma4_multimodal_payload,
+        normalize_gemma4_conversation,
+        prepare_gemma4_multimodal_inputs,
+    )
+except ImportError:
+    from gemma4_multimodal import (
+        build_gemma4_multimodal_payload,
+        normalize_gemma4_conversation,
+        prepare_gemma4_multimodal_inputs,
+    )
+
+try:
     import sentencepiece # 先加载sentencepiece，防止libc冲突
 except:
     pass
@@ -871,6 +884,7 @@ class model:
 
         # 确定配置根目录（用于加载 generation_config.json）
         config_base_path = None
+        self.model_path = path
 
         if id != -99999:
             # 使用已存在的 model id，无法自动关联配置文件，保持默认配置
@@ -911,6 +925,8 @@ class model:
             else:
                 print("path error: ", path)
                 exit(0)
+        if config_base_path is not None:
+            self.model_path = config_base_path
 
         self.direct_query = False;
         self.system_prompt = system_prompt;
@@ -1124,9 +1140,32 @@ class model:
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
         return conversation
 
-    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True, enable_thinking = None) -> int:
+    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,
+                            enable_thinking = None, images: List = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if images:
+            architecture = ""
+            try:
+                architecture = self.config["architectures"][0]
+            except:
+                architecture = ""
+            if architecture == "Gemma4ForConditionalGeneration":
+                if self.hf_tokenizer is None:
+                    raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
+                gemma_conversation = normalize_gemma4_conversation(
+                    copy.deepcopy(conversation), len(images)
+                )
+                native_inputs = prepare_gemma4_multimodal_inputs(
+                    tokenizer = self.hf_tokenizer,
+                    model_dir = self.model_path if self.model_path else self.hf_tokenizer.name_or_path,
+                    model_config = self.config,
+                    conversation = gemma_conversation,
+                    images = images,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                )
+                return len(native_inputs["input_ids"])
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
@@ -1396,24 +1435,58 @@ class model:
                     ]
                 )
                 image = transform(images[0]).reshape([-1]).tolist()
+                tokenizer = self.hf_tokenizer
+                prompt = ""
+                if (conversation != None and len(conversation) != 0):
+                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
+                else:
+                    prompt = query if self.direct_query else self.get_prompt(query, history)
+                input = tokenizer.encode(prompt, add_special_tokens = True)
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                            des.encode(), (ctypes.c_float * len(image))(*image),
+                                                            max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                            False, stop_token_len, stop_token_list)
+                return handle
+            elif (architecture == "Gemma4ForConditionalGeneration"):
+                tokenizer = self.hf_tokenizer
+                if tokenizer is None:
+                    print("Error: Gemma4 multimodal needs a Hugging Face tokenizer.")
+                    exit(0)
+
+                gemma_conversation = None
+                if (conversation != None and len(conversation) != 0):
+                    gemma_conversation = normalize_gemma4_conversation(copy.deepcopy(conversation), len(images))
+                else:
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    gemma_conversation = normalize_gemma4_conversation(
+                        [{"role": "user", "content": prompt_text}],
+                        len(images),
+                    )
+
+                native_inputs = prepare_gemma4_multimodal_inputs(
+                    tokenizer = tokenizer,
+                    model_dir = self.model_path if self.model_path else tokenizer.name_or_path,
+                    model_config = self.config,
+                    conversation = gemma_conversation,
+                    images = images,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                )
+                payload_config, payload = build_gemma4_multimodal_payload(native_inputs, tokenizer)
+                payload_json = json.dumps(payload_config)
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), (ctypes.c_float * len(payload))(*payload.tolist()),
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
+                return handle
             else:
                 print("Error: can't support architectures: " + architecture)
                 exit(0)
-
-            # 有图片输入，多模态模型
-            tokenizer = self.hf_tokenizer
-            prompt = ""
-            if (conversation != None and len(conversation) != 0):
-                prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
-            else:
-                prompt = query if self.direct_query else self.get_prompt(query, history)
-            input = tokenizer.encode(prompt, add_special_tokens = True)
-            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
-            handle = fastllm_lib.launch_response_llm_model_multimodal(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                        des.encode(), (ctypes.c_float * len(image))(*image),
-                                                        max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
-                                                        False, stop_token_len, stop_token_list)
-            return handle
 
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             tokenizer = self.hf_tokenizer

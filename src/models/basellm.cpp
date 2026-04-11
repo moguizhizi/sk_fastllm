@@ -42,6 +42,20 @@ namespace fastllm {
         locker.unlock();
     }
 
+    ResponseContext::~ResponseContext() {
+        for (auto &item : multimodalInput) {
+            for (auto *data : item.second) {
+                delete data;
+            }
+        }
+        multimodalInput.clear();
+
+        while (!resultLogits.empty()) {
+            delete resultLogits.front();
+            resultLogits.pop();
+        }
+    }
+
     void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
         pastKeyValues.clear();
         for (int i = 0; i < blocks; i++) {
@@ -214,10 +228,33 @@ namespace fastllm {
     }
 
     basellm::~basellm() {
-        dictLocker.lock();
-        this->isFree = true;
-        dictLocker.unlock();
+        {
+            std::lock_guard<std::mutex> guard(dictLocker);
+            this->isFree = true;
+        }
         dictCV.notify_all();
+
+        std::thread *loop = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(mainLoopLocker);
+            loop = this->mainLoop;
+            this->mainLoop = nullptr;
+        }
+        if (loop != nullptr) {
+            if (loop->joinable()) {
+                loop->join();
+            }
+            delete loop;
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(responseContextDict.locker);
+            for (auto &item : responseContextDict.dicts) {
+                delete item.second;
+            }
+            responseContextDict.dicts.clear();
+        }
+
         this->weight.ReleaseWeight();
     }
 
@@ -1947,7 +1984,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "ernie4_5" || 
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
-                            this->model_struct == "qwen3_next",  
+                            this->model_struct == "qwen3_next" ||
+                            this->model_struct == "gemma4",
                             this->model_struct + " doesn't support float16");
         } else if (dataType == DataType::BFLOAT16) {
             AssertInFastLLM(this->use_new_engine ||
@@ -1962,7 +2000,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "ernie4_5" || 
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
-                            this->model_struct == "qwen3_next",  
+                            this->model_struct == "qwen3_next" ||
+                            this->model_struct == "gemma4",
                             this->model_struct + " doesn't support bfloat16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32, float16 or bfloat16");
@@ -2325,6 +2364,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             long long bytesPerPage = 0;
             std::map <int, long long> deviceBytesPerPage;
             std::map <int, int> deviceLayerCount;
+            std::map <int, long long> deviceRootBytesPerPage;
+            std::map <int, int> deviceRootLayerCount;
             for (int i = 0; i < block_cnt; i++) {
                 if (layerElementsPerToken[i] <= 0) {
                     continue;
@@ -2332,6 +2373,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 auto &pastKey = pastKeyValuesStorage[i].first;
                 auto &pastValue = pastKeyValuesStorage[i].second;
                 bool accountedByLocalShard = false;
+                long long layerBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
 
                 if (pastKey.multiDeviceData && pastValue.multiDeviceData &&
                     !pastKey.multiDeviceDatas.empty() && !pastValue.multiDeviceDatas.empty()) {
@@ -2358,6 +2400,24 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         deviceLayerCount[id]++;
                         accountedByLocalShard = true;
                     }
+
+                    // Multi-cuda keeps a root paged cache manager on the root device in
+                    // addition to the per-device local shard managers. Count that extra
+                    // global allocation on the root device, or GPU 0 pages will be overestimated.
+                    int rootDeviceId = -1;
+                    if (pastKey.multiDeviceDatas.size() > 1 || pastValue.multiDeviceDatas.size() > 1) {
+                        if (pastKey.dataDevice == DataDevice::CUDA && !pastKey.dataDeviceIds.empty()) {
+                            rootDeviceId = pastKey.dataDeviceIds[0];
+                        } else if (pastValue.dataDevice == DataDevice::CUDA && !pastValue.dataDeviceIds.empty()) {
+                            rootDeviceId = pastValue.dataDeviceIds[0];
+                        }
+                    }
+                    if (rootDeviceId >= 0) {
+                        deviceIds.insert(rootDeviceId);
+                        deviceBytesPerPage[rootDeviceId] += layerBytesPerPage;
+                        deviceRootBytesPerPage[rootDeviceId] += layerBytesPerPage;
+                        deviceRootLayerCount[rootDeviceId]++;
+                    }
                 }
 
                 if (!accountedByLocalShard) {
@@ -2367,12 +2427,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                     } else if (pastValue.dataDevice == DataDevice::CUDA && !pastValue.dataDeviceIds.empty()) {
                         id = pastValue.dataDeviceIds[0];
                     }
-                    long long layerBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
                     deviceIds.insert(id);
                     deviceBytesPerPage[id] += layerBytesPerPage;
                     deviceLayerCount[id]++;
                 }
-                bytesPerPage += GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
+                bytesPerPage += layerBytesPerPage;
             }
 
             bool updatedPages = false;
@@ -2405,10 +2464,13 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long avail = freeSizes[id] - reserved;
                         long long perPageOnDevice = it.second;
-                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                        long long rootBytesPerPage = deviceRootBytesPerPage.count(id) ? deviceRootBytesPerPage[id] : 0;
+                        long long localBytesPerPage = perPageOnDevice - rootBytesPerPage;
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, localKVPerPage=%.2f MB, rootKVPerPage=%.2f MB, totalKVPerPage=%.2f MB, tokenGrowingLayers=%d, rootManagers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
-                               avail / 1e9, perPageOnDevice / 1e6,
-                               deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
+                               avail / 1e9, localBytesPerPage / 1e6, rootBytesPerPage / 1e6, perPageOnDevice / 1e6,
+                               deviceLayerCount.count(id) ? deviceLayerCount[id] : 0,
+                               deviceRootLayerCount.count(id) ? deviceRootLayerCount[id] : 0);
                         if (perPageOnDevice > 0 && avail > 0) {
                             int pages = (int)(avail / perPageOnDevice);
                             maxPages = std::min(maxPages, pages);

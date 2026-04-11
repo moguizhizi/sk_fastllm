@@ -10,6 +10,25 @@
 #include "utils.h"
 
 namespace fastllm {
+    static uint64_t GetConvertedBufferBytes(const Data &data) {
+        uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
+        return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
+    }
+
+    static void InvalidateCpuMirror(Data &data) {
+        if (data.cpuData == nullptr) {
+            return;
+        }
+#ifdef USE_MMAP
+        if (data.name.empty()) {
+            delete[] data.cpuData;
+        }
+#else
+        delete[] data.cpuData;
+#endif
+        data.cpuData = nullptr;
+    }
+
     CudaDevice::CudaDevice() {
         this->deviceType = "cuda";
         this->ops["ToFloat16"] = (BaseOperator*)(new CudaToFloat16());
@@ -44,6 +63,7 @@ namespace fastllm {
         this->ops["Relu"] = (BaseOperator*)(new CudaReluOp());
         this->ops["Gelu"] = (BaseOperator*)(new CudaGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
+        this->ops["Geglu"] = (BaseOperator*)(new CudaGegluOp());
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
         this->ops["Sigmoid"] = (BaseOperator*)(new CudaSigmoidOp());
         this->ops["MambaSoftplus"] = (BaseOperator*)(new CudaMambaSoftplusOp());
@@ -132,7 +152,8 @@ namespace fastllm {
             float *old = (float*)data.cudaData;
             data.dataType = DataType::FLOAT16;
             data.UpdateUnitSize();
-            data.cudaData = FastllmCudaMalloc(data.GetBytes());
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToHalf(old, data.cudaData, len);
             FastllmCudaFree(old);
@@ -144,6 +165,8 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCpuMirror(data);
     }
 
     void CudaToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -161,7 +184,8 @@ namespace fastllm {
             uint16_t *old = (uint16_t*)data.cudaData;
             data.dataType = DataType::FLOAT32;
             data.UpdateUnitSize();
-            data.cudaData = FastllmCudaMalloc(data.GetBytes());
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmHalfToFloat(old, data.cudaData, len);
             FastllmCudaFree(old);
@@ -169,13 +193,16 @@ namespace fastllm {
             uint16_t *old = (uint16_t*)data.cudaData;
             data.dataType = DataType::FLOAT32;
             data.UpdateUnitSize();
-            data.cudaData = FastllmCudaMalloc(data.GetBytes());
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmBF16ToFloat(old, data.cudaData, len);
             FastllmCudaFree(old);
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCpuMirror(data);
     }
 
     void CudaConvertToFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -251,7 +278,8 @@ namespace fastllm {
             float *old = (float*)data.cudaData;
             data.dataType = DataType::BFLOAT16;
             data.UpdateUnitSize();
-            data.cudaData = FastllmCudaMalloc(data.GetBytes());
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToBF16(old, data.cudaData, len);
             FastllmCudaFree(old);
@@ -263,6 +291,8 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCpuMirror(data);
     }
 
     void CudaConvertToBFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -1141,6 +1171,33 @@ namespace fastllm {
         FastllmCudaGelu(input, output);
     }
 
+    void DoCudaGegluReshape(Data &input, Data &output) {
+        DoCudaSwigluReshape(input, output);
+    }
+
+    void CudaGegluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCudaGegluReshape(input, output);
+    }
+
+    void DoCudaGeglu(Data &input, Data &output) {
+        output.Allocate();
+        FastllmCudaGeglu(input, output);
+    }
+
+    void CudaGegluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Geglu error: Data's type should be float32, float16 or bfloat16.\n");
+        DoCudaGeglu(input, output);
+    }
+
     void CudaExpOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -1803,8 +1860,24 @@ namespace fastllm {
         FastllmCudaAddHostToDevice(output.cudaData, output.cpuData, len, output.dataType);
     }
 
+    static inline void ApplyCudaMoeGate(Data &input, Data &output, MoeGateType gateType, bool isCrossSwiglu = false) {
+        if (gateType == MoeGateGeglu) {
+            DoCudaGegluReshape(input, output);
+            DoCudaGeglu(input, output);
+            return;
+        }
+        DoCudaSwigluReshape(input, output);
+        if (isCrossSwiglu) {
+            output.Allocate();
+            FastllmCudaCrossSwiglu(input, output);
+        } else {
+            DoCudaSwiglu(input, output);
+        }
+    }
+
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu) {
+        Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
+        MoeGateType gateType) {
 // static std::map <std::string, float> timeCnt;
 // static std::chrono::steady_clock::time_point lastMergeMoeCallTime;
 // auto now = std::chrono::steady_clock::now();
@@ -1958,12 +2031,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             );
             DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
             DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
-            DoCudaSwigluReshape(tempMiddle, tempSwiglu);
-            if (isCrossSwiglu) {
-                FastllmCudaCrossSwiglu(tempMiddle, tempSwiglu);
-            } else {
-                DoCudaSwiglu(tempMiddle, tempSwiglu);
-            }
+            ApplyCudaMoeGate(tempMiddle, tempSwiglu, gateType, isCrossSwiglu);
             DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
             DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
 
@@ -2091,7 +2159,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
     }
 
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, float sharedScale) {
+                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType) {
 // static std::map<std::string, float> mergeMoeTimeCnt;
 // auto st = std::chrono::system_clock::now();
         int curDeviceId = FastllmCudaGetDevice();
@@ -2142,8 +2210,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     DoCudaLinear(input, *weights[idx * 2], *GetEmptyData(), w3);
 // ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
-                    DoCudaSwigluReshape(w3, w1);
-                    DoCudaSwiglu(w3, w1);
+                    ApplyCudaMoeGate(w3, w1, gateType);
 // ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
@@ -2246,8 +2313,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
 // ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
-                    DoCudaSwigluReshape(tempMiddle, tempSwiglu);
-                    DoCudaSwiglu(tempMiddle, tempSwiglu);
+                    ApplyCudaMoeGate(tempMiddle, tempSwiglu, gateType);
 // ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
@@ -2291,9 +2357,11 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
 
         DoCudaMergeMOE (
-            input, output, index, score, w1, w2, w3, weights, biass, sharedScale
+            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType
         );
     }
 

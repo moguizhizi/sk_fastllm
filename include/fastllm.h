@@ -484,7 +484,7 @@ namespace fastllm {
 
         std::vector<int> Shape() const; 
 
-        void Print() const; // 输出
+        void Print(const std::string &name = "") const; // 输出
 
         void CalcWeightSum(); // 计算WeightSum
 
@@ -780,9 +780,13 @@ namespace fastllm {
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
+    enum MoeGateType {
+        MoeGateSwiglu = 0,
+        MoeGateGeglu = 1
+    };
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float sharedScale, Data &output, int layer = 0);
+                float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu);
     
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale);
 
@@ -811,7 +815,7 @@ namespace fastllm {
 
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
-    void Linear(Data &input, Data &weight, const Data &bias, Data &output);
+    void Linear(Data &input, Data &weight, const Data &bias, Data &output, bool keepTpReplicated = false);
 
     void LinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output);
 
@@ -879,6 +883,8 @@ namespace fastllm {
     void Gelu(const Data &input, Data &output);
     
     void GeluNew(const Data &input, Data &output);
+
+    void Geglu(const fastllm::Data &input, fastllm::Data &output);
 
     void Swiglu(const fastllm::Data &input, fastllm::Data &output);
 
