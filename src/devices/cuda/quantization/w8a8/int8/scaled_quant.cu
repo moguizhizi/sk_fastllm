@@ -264,3 +264,36 @@ bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output,
 
     return true;
 }
+
+bool dynamic_scaled_int8_quant(
+    const fastllm::Data &input, fastllm::Data &output, fastllm::Data &scale, std::optional<fastllm::Data> const &azp) {
+    float *cudaInput = (float *)FastllmCudaPrepareInput(input);
+    float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
+    if (azp.has_value()) {
+        float *cudaazp = (float *)FastllmCudaPrepareInput(azp);
+    }
+
+    float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+
+    int input_num_dims = input.dims.size();
+    int axis = -1;
+    axis = (axis % input_num_dims + input_num_dims) % input_num_dims;
+
+    int const hidden_size = input.dims[axis];
+    int const num_tokens = input.Count(0) / hidden_size;
+
+    dim3 const grid(num_tokens);
+    dim3 const block(std::min(hidden_size, 256));
+
+    FASTLLM_DISPATCH_FLOATING_TYPES(input.dataType, {
+        if (!azp.has_value()) {
+            dynamic_scaled_int8_quant_kernel<scalar_t, float>
+                <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, cudaScale, hidden_size);
+        } else {
+            dynamic_scaled_int8_azp_quant_kernel<scalar_t, float, int32_t>
+                <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, cudaScale, (int32_t *)cudaazp, hidden_size);
+        }
+    });
+
+    return true;
+}
