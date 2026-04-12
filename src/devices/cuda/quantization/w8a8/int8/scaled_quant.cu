@@ -8,6 +8,30 @@
 #include "dispatch_utils.h"
 #include "libtorch_stable/quantization/vectorization_utils.cuh"
 
+// MinMax structure to hold min and max values in one go
+struct MinMax {
+  float min, max;
+
+  __host__ __device__ MinMax()
+      : min(std::numeric_limits<float>::max()),
+        max(std::numeric_limits<float>::lowest()) {}
+
+  __host__ __device__ explicit MinMax(float v) : min(v), max(v) {}
+
+  __host__ __device__ MinMax& operator+=(float v) {
+    min = fminf(min, v);
+    max = fmaxf(max, v);
+    return *this;
+  }
+
+  // merge two MinMax objects
+  __host__ __device__ MinMax& operator&=(const MinMax& other) {
+    min = fminf(min, other.min);
+    max = fmaxf(max, other.max);
+    return *this;
+  }
+};
+
 static inline __device__ int8_t float_to_int8_rn(float x) {
 #ifdef USE_ROCM
     static constexpr auto i8_min = static_cast<float>(std::numeric_limits<int8_t>::min());
