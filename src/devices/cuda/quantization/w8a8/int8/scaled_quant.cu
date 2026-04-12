@@ -5,7 +5,8 @@
 #include <cmath>
 
 #include "cub_helpers.h"
-#include "dispatch_utils.h"
+#include "fastllm-vllm-cuda-common.cuh"
+#include "kernel_macros.cuh"
 #include "libtorch_stable/quantization/vectorization_utils.cuh"
 
 // MinMax structure to hold min and max values in one go
@@ -234,11 +235,11 @@ __global__ void dynamic_scaled_int8_azp_quant_kernel(
 }
 
 bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output, const float scale, std::optional<fastllm::Data> const &azp) {
-    TORCH_CHECK(!azp || azp.Count(0) == 1);
+    TORCH_CHECK(!azp || azp.value().Count(0) == 1);
 
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     if (azp.has_value()) {
-        float *cudaazp = (float *)FastllmCudaPrepareInput(azp);
+        float *cudaazp = (float *)FastllmCudaPrepareInput(azp.value());
     }
 
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
@@ -253,7 +254,7 @@ bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output,
     dim3 const grid(num_tokens);
     dim3 const block(std::min(hidden_size, 256));
 
-    FASTLLM_DISPATCH_FLOATING_TYPES(input.dataType, {
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
         if (!azp.has_value()) {
             static_scaled_int8_quant_kernel<scalar_t><<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, scale, hidden_size);
         } else {
@@ -270,7 +271,7 @@ bool dynamic_scaled_int8_quant(
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
     if (azp.has_value()) {
-        float *cudaazp = (float *)FastllmCudaPrepareInput(azp);
+        float *cudaazp = (float *)FastllmCudaPrepareInput(azp.value());
     }
 
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
@@ -285,7 +286,7 @@ bool dynamic_scaled_int8_quant(
     dim3 const grid(num_tokens);
     dim3 const block(std::min(hidden_size, 256));
 
-    FASTLLM_DISPATCH_FLOATING_TYPES(input.dataType, {
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
         if (!azp.has_value()) {
             dynamic_scaled_int8_quant_kernel<scalar_t, float>
                 <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, cudaScale, hidden_size);
