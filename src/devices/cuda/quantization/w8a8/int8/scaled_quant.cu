@@ -186,6 +186,53 @@ __global__ void dynamic_scaled_int8_quant_kernel(
         [=] __device__(int8_t &dst, const scalar_t &src) { dst = float_to_int8_rn(static_cast<float>(src) * inv_s); });
 }
 
+template <typename scalar_t, typename scale_t, typename azp_t>
+__global__ void dynamic_scaled_int8_azp_quant_kernel(
+    const scalar_t *__restrict__ input, int8_t *__restrict__ output, scale_t *scale_out, azp_t *azp_out, const int hidden_size) {
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int64_t token_idx = blockIdx.x;
+
+    // Must be performed using 64-bit math to avoid integer overflow.
+    const scalar_t *row_in = input + token_idx * hidden_size;
+    int8_t *row_out = output + token_idx * hidden_size;
+
+    MinMax thread_mm;
+    vectorize_read_with_alignment<16>(
+        row_in, hidden_size, tid, stride, [&] __device__(const scalar_t &src) { thread_mm += static_cast<float>(src); });
+
+    using BlockReduce = cub::BlockReduce<MinMax, 256>;
+    __shared__ typename BlockReduce::TempStorage tmp;
+
+    MinMax mm = BlockReduce(tmp).Reduce(
+        thread_mm,
+        [] __device__(MinMax a, const MinMax &b) {
+            a &= b;
+            return a;
+        },
+        blockDim.x);
+
+    __shared__ float scale_sh;
+    __shared__ azp_t azp_sh;
+    if (tid == 0) {
+        float s = (mm.max - mm.min) / 255.f;
+        float zp = nearbyintf(-128.f - mm.min / s); // round-to-even
+        scale_sh = s;
+        azp_sh = azp_t(zp);
+        scale_out[blockIdx.x] = s;
+        azp_out[blockIdx.x] = azp_sh;
+    }
+    __syncthreads();
+
+    const float inv_s = 1.f / scale_sh;
+    const azp_t azp = azp_sh;
+
+    vectorize_with_alignment<16>(row_in, row_out, hidden_size, tid, stride, [=] __device__(int8_t &dst, const scalar_t &src) {
+        const auto v = static_cast<float>(src) * inv_s;
+        dst = int32_to_int8(float_to_int32_rn(v) + azp);
+    });
+}
+
 bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output, const float scale, std::optional<fastllm::Data> const &azp) {
     TORCH_CHECK(!azp || azp.Count(0) == 1);
 
