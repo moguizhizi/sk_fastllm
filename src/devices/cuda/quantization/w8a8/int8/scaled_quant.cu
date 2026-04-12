@@ -10,27 +10,32 @@
 
 // MinMax structure to hold min and max values in one go
 struct MinMax {
-  float min, max;
+    float min, max;
 
-  __host__ __device__ MinMax()
-      : min(std::numeric_limits<float>::max()),
-        max(std::numeric_limits<float>::lowest()) {}
+    __host__ __device__ MinMax() : min(std::numeric_limits<float>::max()), max(std::numeric_limits<float>::lowest()) {}
 
-  __host__ __device__ explicit MinMax(float v) : min(v), max(v) {}
+    __host__ __device__ explicit MinMax(float v) : min(v), max(v) {}
 
-  __host__ __device__ MinMax& operator+=(float v) {
-    min = fminf(min, v);
-    max = fmaxf(max, v);
-    return *this;
-  }
+    __host__ __device__ MinMax &operator+=(float v) {
+        min = fminf(min, v);
+        max = fmaxf(max, v);
+        return *this;
+    }
 
-  // merge two MinMax objects
-  __host__ __device__ MinMax& operator&=(const MinMax& other) {
-    min = fminf(min, other.min);
-    max = fmaxf(max, other.max);
-    return *this;
-  }
+    // merge two MinMax objects
+    __host__ __device__ MinMax &operator&=(const MinMax &other) {
+        min = fminf(min, other.min);
+        max = fmaxf(max, other.max);
+        return *this;
+    }
 };
+
+__host__ __device__ inline MinMax operator+(MinMax a, float v) {
+    return a += v;
+}
+__host__ __device__ inline MinMax operator&(MinMax a, const MinMax &b) {
+    return a &= b;
+}
 
 static inline __device__ int8_t float_to_int8_rn(float x) {
 #ifdef USE_ROCM
@@ -150,40 +155,35 @@ __global__ void static_scaled_int8_azp_quant_kernel(
 
 template <typename scalar_t, typename scale_t>
 __global__ void dynamic_scaled_int8_quant_kernel(
-    const scalar_t* __restrict__ input, int8_t* __restrict__ output,
-    scale_t* scale_out, const int hidden_size) {
-  const int tid = threadIdx.x;
-  const int stride = blockDim.x;
-  const int64_t token_idx = blockIdx.x;
+    const scalar_t *__restrict__ input, int8_t *__restrict__ output, scale_t *scale_out, const int hidden_size) {
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int64_t token_idx = blockIdx.x;
 
-  // Must be performed using 64-bit math to avoid integer overflow.
-  const scalar_t* row_in = input + token_idx * hidden_size;
-  int8_t* row_out = output + token_idx * hidden_size;
+    // Must be performed using 64-bit math to avoid integer overflow.
+    const scalar_t *row_in = input + token_idx * hidden_size;
+    int8_t *row_out = output + token_idx * hidden_size;
 
-  // calculate for absmax
-  float thread_max = 0.f;
-  vectorize_read_with_alignment<16>(
-      row_in, hidden_size, tid, stride, [&] __device__(const scalar_t& src) {
+    // calculate for absmax
+    float thread_max = 0.f;
+    vectorize_read_with_alignment<16>(row_in, hidden_size, tid, stride, [&] __device__(const scalar_t &src) {
         const float v = fabsf(static_cast<float>(src));
         thread_max = fmaxf(thread_max, v);
-      });
-  using BlockReduce = cub::BlockReduce<float, 256>;
-  __shared__ typename BlockReduce::TempStorage tmp;
-  float block_max = BlockReduce(tmp).Reduce(thread_max, CubMaxOp{}, blockDim.x);
-  __shared__ float absmax;
-  if (tid == 0) {
-    absmax = block_max;
-    scale_out[blockIdx.x] = absmax / 127.f;
-  }
-  __syncthreads();
+    });
+    using BlockReduce = cub::BlockReduce<float, 256>;
+    __shared__ typename BlockReduce::TempStorage tmp;
+    float block_max = BlockReduce(tmp).Reduce(thread_max, CubMaxOp{}, blockDim.x);
+    __shared__ float absmax;
+    if (tid == 0) {
+        absmax = block_max;
+        scale_out[blockIdx.x] = absmax / 127.f;
+    }
+    __syncthreads();
 
-  float inv_s = (absmax == 0.f) ? 0.f : 127.f / absmax;
+    float inv_s = (absmax == 0.f) ? 0.f : 127.f / absmax;
 
-  vectorize_with_alignment<16>(
-      row_in, row_out, hidden_size, tid, stride,
-      [=] __device__(int8_t& dst, const scalar_t& src) {
-        dst = float_to_int8_rn(static_cast<float>(src) * inv_s);
-      });
+    vectorize_with_alignment<16>(row_in, row_out, hidden_size, tid, stride,
+        [=] __device__(int8_t &dst, const scalar_t &src) { dst = float_to_int8_rn(static_cast<float>(src) * inv_s); });
 }
 
 bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output, const float scale, std::optional<fastllm::Data> const &azp) {
