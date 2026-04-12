@@ -5,7 +5,12 @@ void showError(cudaError_t result, char const* const message, const char* const 
 
 void *FastllmCudaPrepareInput(const fastllm::Data &input);
 void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
+
+void *FastllmCudaPrepareOutput(fastllm::Data &output);
+
 void FastllmCudaFree(void *ret);
+void *FastllmCudaMalloc(size_t size);
+void DeviceSync();
 
 int FastllmCudaGetDevice();
 void FastllmCudaSetDevice(int gpu_id);
