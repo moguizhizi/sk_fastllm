@@ -234,15 +234,11 @@ __global__ void dynamic_scaled_int8_azp_quant_kernel(
     });
 }
 
-bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output, const float scale, std::optional<fastllm::Data> const &azp) {
-    TORCH_CHECK(!azp || azp.value().Count(0) == 1);
-
+bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output, const float scale, std::optional<int32_t> const &azp) {
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
-    if (azp.has_value()) {
-        float *cudaazp = (float *)FastllmCudaPrepareInput(azp.value());
-    }
-
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
+
+    bool has_azp = azp.has_value();
 
     int input_num_dims = input.dims.size();
     int axis = -1;
@@ -254,14 +250,14 @@ bool static_scaled_int8_quant(const fastllm::Data &input, fastllm::Data &output,
     dim3 const grid(num_tokens);
     dim3 const block(std::min(hidden_size, 256));
 
-    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
-        if (!azp.has_value()) {
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, LAUNCH_KERNEL({
+        if (!has_azp) {
             static_scaled_int8_quant_kernel<scalar_t><<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, scale, hidden_size);
         } else {
             static_scaled_int8_azp_quant_kernel<scalar_t, int32_t>
-                <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, scale, (int32_t *)cudaazp, hidden_size);
+                <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, scale, azp.value(), hidden_size);
         }
-    });
+    }));
 
     return true;
 }
@@ -270,8 +266,9 @@ bool dynamic_scaled_int8_quant(
     const fastllm::Data &input, fastllm::Data &output, fastllm::Data &scale, std::optional<fastllm::Data> const &azp) {
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     float *cudaScale = (float *)FastllmCudaPrepareInput(scale);
+    float *cudaazp = nullptr;
     if (azp.has_value()) {
-        float *cudaazp = (float *)FastllmCudaPrepareInput(azp.value());
+        cudaazp = (float *)FastllmCudaPrepareInput(azp.value());
     }
 
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
@@ -286,7 +283,7 @@ bool dynamic_scaled_int8_quant(
     dim3 const grid(num_tokens);
     dim3 const block(std::min(hidden_size, 256));
 
-    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, {
+    FASTLLM_DISPATCH_FLOAT_TYPES(input.dataType, LAUNCH_KERNEL({
         if (!azp.has_value()) {
             dynamic_scaled_int8_quant_kernel<scalar_t, float>
                 <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, cudaScale, hidden_size);
@@ -294,7 +291,7 @@ bool dynamic_scaled_int8_quant(
             dynamic_scaled_int8_azp_quant_kernel<scalar_t, float, int32_t>
                 <<<grid, block>>>((scalar_t *)cudaInput, (int8_t *)cudaOutput, cudaScale, (int32_t *)cudaazp, hidden_size);
         }
-    });
+    }));
 
     return true;
 }
