@@ -19,9 +19,32 @@ rm -rf "$folder"
 mkdir "$folder"
 cd $folder
 
+pick_cxx_compiler() {
+    if [ -n "${CXX:-}" ] && command -v "$CXX" >/dev/null 2>&1; then
+        command -v "$CXX"
+        return 0
+    fi
+
+    for compiler in /usr/bin/g++-11 /usr/bin/g++-10 g++ c++; do
+        if command -v "$compiler" >/dev/null 2>&1; then
+            command -v "$compiler"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+CXX_COMPILER="$(pick_cxx_compiler)"
+if [ -z "$CXX_COMPILER" ]; then
+    echo "C++ compiler not found. Please install g++ or set CXX to a valid compiler path."
+    exit -1
+fi
+echo "Using C++ compiler: ${CXX_COMPILER}"
+
 # cpu
 rm -rf CMakeCache.txt CMakeFiles
-cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=OFF -DUSE_NUMAS=ON
+cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=OFF -DUSE_NUMAS=ON -DCMAKE_CXX_COMPILER="${CXX_COMPILER}"
 make fastllm_tools -j30
 if [ $? != 0 ]; then
     exit -1
@@ -39,7 +62,7 @@ cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cpu.so
 
 # cuda-12
 rm -rf CMakeCache.txt CMakeFiles
-CUDA_ARCH_LIST="70;75;80;89;90;100;120"
+CUDA_ARCH_LIST="60-real;70-real;75-real;80-real;89-real;90-real;100-real;120"
 if [ -x /usr/local/cuda/bin/nvcc ]; then
     CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 elif [ -x /usr/local/cuda-12.9/bin/nvcc ]; then
@@ -57,9 +80,10 @@ cmake .. \
     -DUSE_NUMAS=ON \
     -DCUDA_ARCH="${CUDA_ARCH_LIST}" \
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH_LIST}" \
-    -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 \
-    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 \
-    -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}"
+    -DCMAKE_CXX_COMPILER="${CXX_COMPILER}" \
+    -DCMAKE_CUDA_HOST_COMPILER="${CXX_COMPILER}" \
+    -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}" \
+    -DCMAKE_CUDA_FLAGS="--split-compile=16"
 make fastllm_tools -j30
 if [ $? != 0 ]; then
     exit -1

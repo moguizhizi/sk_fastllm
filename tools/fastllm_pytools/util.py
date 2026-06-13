@@ -1,6 +1,197 @@
 import argparse
 import os
 import sys
+import subprocess
+import glob
+
+def _has_cuda_device() -> bool:
+    if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
+        return True
+    try:
+        return subprocess.run(["nvidia-smi", "-L"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=8).returncode == 0
+    except Exception:
+        return False
+
+def _normalize_mtp_arg(value) -> int:
+    try:
+        value = int(value)
+    except Exception:
+        value = 0
+    return max(0, value)
+
+def _total_memory_gib() -> float:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except Exception:
+        pass
+    return 0.0
+
+def _uses_cuda_device(device) -> bool:
+    if not device:
+        return False
+    return "cuda" in str(device).lower() or str(device).lower().startswith("cudapp=")
+
+def _uses_multicuda_device(device) -> bool:
+    if not device:
+        return False
+    return "multicuda" in str(device).lower()
+
+def _uses_thread_tp(tp) -> bool:
+    if tp is None:
+        return False
+    spec = str(tp).strip().lower()
+    return spec not in ["", "false", "off", "none", "disable"]
+
+def _arg_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ["", "false", "0", "off", "none", "disable"]
+
+def _cuda_device_count() -> int:
+    try:
+        result = subprocess.run(["nvidia-smi", "-L"],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                text=True,
+                                timeout=8)
+        if result.returncode == 0:
+            return len([line for line in result.stdout.splitlines() if line.strip()])
+    except Exception:
+        pass
+    try:
+        return len(glob.glob("/dev/nvidia[0-9]*"))
+    except Exception:
+        return 0
+
+def _first_thread_tp_cuda_device(tp) -> str:
+    spec = str(tp or "").strip()
+    lower = spec.lower()
+    if lower in ["", "auto", "true", "on"]:
+        return "cuda:0"
+    if lower.isdigit():
+        return "cuda:0"
+
+    first_part = spec.split(",")[0].strip()
+    first_lower = first_part.lower()
+    if first_lower.startswith("multicuda:") or first_lower.startswith("cuda:"):
+        first_part = first_part.split(":", 1)[1].strip()
+    elif first_lower in ["multicuda", "cuda"]:
+        return "cuda:0"
+
+    device_id = ""
+    for ch in first_part:
+        if ch.isdigit():
+            device_id += ch
+        elif device_id:
+            break
+    return "cuda:" + (device_id if device_id != "" else "0")
+
+def _thread_tp_cuda_device_spec(tp) -> str:
+    spec = str(tp or "").strip()
+    lower = spec.lower()
+    if lower in ["", "false", "off", "none", "disable"]:
+        return ""
+    if lower in ["auto", "true", "on"]:
+        count = _cuda_device_count()
+        if count <= 1:
+            return "cuda:0"
+        return "cuda:" + ",".join(str(i) for i in range(count))
+    if lower.isdigit():
+        requested = int(lower)
+        if requested == 0:
+            return "cuda:0"
+        count = _cuda_device_count()
+        if count > 0:
+            requested = min(requested, count)
+        return "cuda:" + ",".join(str(i) for i in range(requested))
+
+    if lower.startswith("multicuda:") or lower.startswith("cuda:"):
+        spec = spec.split(":", 1)[1].strip()
+    elif lower in ["multicuda", "cuda"]:
+        return "cuda:0"
+    return "cuda:" + spec
+
+def _normalize_thread_tp_arg(tp) -> str:
+    spec = str(tp or "").strip()
+    lower = spec.lower()
+    if lower in ["", "false", "off", "none", "disable"]:
+        return spec
+    return _thread_tp_cuda_device_spec(spec)
+
+def _explain_thread_tp_arg(original, normalized):
+    spec = str(original or "").strip()
+    if spec == "":
+        return
+    lower = spec.lower()
+    if lower in ["false", "off", "none", "disable"]:
+        print(f"[tp] --tp {spec}: thread-level tensor parallel is disabled")
+        return
+    normalized = str(normalized or "").strip()
+    if lower == "0":
+        print(f"[tp] --tp 0: interpreted as CUDA device id 0 => {normalized}")
+    elif lower.isdigit():
+        print(f"[tp] --tp {spec}: interpreted as using {int(lower)} CUDA device(s) => {normalized}")
+    elif lower in ["auto", "true", "on"]:
+        print(f"[tp] --tp {spec}: automatically using detected CUDA devices => {normalized}")
+    elif lower.startswith("cuda:") or lower.startswith("multicuda:"):
+        print(f"[tp] --tp {spec}: normalized explicit device list => {normalized}")
+    else:
+        print(f"[tp] --tp {spec}: completed as CUDA device list => {normalized}")
+
+def apply_page_size_default(args):
+    if (getattr(args, "page_size", -1) <= 0 and
+        (_uses_multicuda_device(getattr(args, "device", "")) or
+         _uses_multicuda_device(getattr(args, "moe_device", "")))):
+        try:
+            args.page_size = int(os.environ.get("FASTLLM_MULTICUDA_PAGE_SIZE", "16"))
+        except:
+            args.page_size = 16
+    return args
+
+def apply_prefix_cache_env(args):
+    prefix_cache = getattr(args, "prefix_cache", "")
+    if (prefix_cache != ""):
+        os.environ["FASTLLM_PREFIX_CACHE"] = str(prefix_cache)
+
+    env_args = [
+        ("prefix_cache_snapshot_interval_pages", "FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES"),
+        ("prefix_cache_snapshot_max_per_request", "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST"),
+        ("prefix_cache_snapshot_max_records", "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS"),
+    ]
+    for arg_name, env_name in env_args:
+        value = getattr(args, arg_name, -1)
+        try:
+            value = int(value)
+        except:
+            value = -1
+        if (value > 0):
+            os.environ[env_name] = str(value)
+    return args
+
+def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
+    return (architecture in [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "MiniMaxM1ForCausalLM",
+        "MiniMaxText01ForCausalLM",
+        "HunYuanMoEV1ForCausalLM",
+        "Ernie4_5_MoeForCausalLM",
+        "PanguProMoEForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "MiniMaxM2ForCausalLM",
+    ] or model_type in ["deepseek_v4", "qwen3_5_moe"] or text_model_type == "qwen3_5_moe_text")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
@@ -18,7 +209,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
+    parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
@@ -26,8 +219,22 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
     parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
-    parser.add_argument("--page_size", type = int, default = 128, help = "设置paged cache每页的大小（token数）")
+    parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
+    parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
+                        help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
+    parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
+                        dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
+                        help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
+    parser.add_argument("--prefix_cache_snapshot_max_per_request", "--prefix-cache-snapshot-max-per-request",
+                        dest = "prefix_cache_snapshot_max_per_request", type = int, default = -1,
+                        help = "单请求最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST")
+    parser.add_argument("--prefix_cache_snapshot_max_records", "--prefix-cache-snapshot-max-records",
+                        dest = "prefix_cache_snapshot_max_records", type = int, default = -1,
+                        help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
+    parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
+    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
@@ -58,6 +265,12 @@ def expand_cudapp_device(device_str):
     if not device_str or not device_str.startswith("cudapp="):
         return device_str
     spec = device_str[len("cudapp="):]
+    if ',' in spec:
+        raw_device_ids = [device_id.strip() for device_id in spec.split(',')]
+        if any(device_id == '' for device_id in raw_device_ids):
+            raise ValueError(f"invalid cudapp device list: {spec}")
+        device_ids = [int(device_id) for device_id in raw_device_ids]
+        return str({f'cuda:{device_id}': 1 for device_id in device_ids})
     if ':' in spec:
         weights = [int(w) for w in spec.split(':')]
     else:
@@ -72,10 +285,15 @@ def make_normal_llm_model(args):
             with open(args.model, "r", encoding = "utf-8") as file:
                 args_config = json.load(file)
                 for it in args_config.keys():
-                    if (it == "FASTLLM_USE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
+                    if (it == "FASTLLM_ACTIVATE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
                         os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
-                
+
+    user_set_device = bool(args.device and args.device != "")
+    user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+    mtp = _normalize_mtp_arg(getattr(args, "mtp", 0))
+    args.mtp = mtp
+
     usenuma = False
     try:
         from ftllm.env import env
@@ -87,6 +305,8 @@ def make_normal_llm_model(args):
     if (args.path == '' or args.path is None):
         print("model can't be empty. (Example: ftllm run MODELNAME)")
         exit(0)
+    if (_arg_enabled(getattr(args, "triton", False))):
+        os.environ["FASTLLM_CUDA_TRITON"] = "1"
     if not(os.path.exists(args.path)):
         if (hasattr(args, "model_name") and args.model_name == ''):
             args.model_name = args.path
@@ -108,6 +328,8 @@ def make_normal_llm_model(args):
     config_path = os.path.join(args.path, "config.json")
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
+    is_moe_model = False
+    is_thread_tp_moe_model = False
     if (os.path.exists(config_path)):
         try:
             import json
@@ -118,33 +340,58 @@ def make_normal_llm_model(args):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
+            is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
+
+            is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
+                          model_type == 'step3p5' or
+                          text_model_type == 'step3p5')
+            is_step3p7 = (architecture == 'Step3p7ForConditionalGeneration' or
+                          model_type == 'step3p7')
+            if is_step3p5:
+                is_thread_tp_moe_model = True
+                if (args.cache_history == ""):
+                    args.cache_history = "true"
+                if (args.moe_device == "" and not(args.device and args.device != "")):
+                    total_mem_gib = _total_memory_gib()
+                    can_hold_cpu_moe = total_mem_gib >= 220.0
+                    if (_has_cuda_device() and can_hold_cpu_moe):
+                        args.device = "cuda"
+                        args.moe_device = "cpu"
+                    else:
+                        args.device = "cpu"
+                        args.moe_device = "disk"
+                if (args.chunked_prefill_size <= 0):
+                    args.chunked_prefill_size = 128
+                if (args.tokens <= 0 and not is_step3p7 and not _uses_thread_tp(getattr(args, "tp", ""))):
+                    args.tokens = 32768
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
+                architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
                 architecture == 'Glm4MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
-            if (architecture == 'DeepseekV3ForCausalLM' or 
-                architecture == 'DeepseekV2ForCausalLM' or 
-                architecture == 'Qwen3MoeForCausalLM' or 
-                architecture == 'Qwen3_5MoeForConditionalGeneration' or
-                model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
-                architecture == 'MiniMaxM1ForCausalLM' or 
-                architecture == 'MiniMaxText01ForCausalLM' or 
-                architecture == 'HunYuanMoEV1ForCausalLM' or 
-                architecture == 'Ernie4_5_MoeForCausalLM' or 
-                architecture == 'PanguProMoEForCausalLM' or
-                architecture == 'Glm4MoeForCausalLM' or 
-                architecture == 'Qwen3NextForCausalLM' or
-                architecture == 'MiniMaxM2ForCausalLM'):
+            if ((architecture == 'Qwen3_5ForConditionalGeneration' or
+                 model_type == 'qwen3_5' or text_model_type == 'qwen3_5_text') and
+                (not user_set_device) and _has_cuda_device()):
+                args.device = "cuda"
+            if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe'):
+                is_thread_tp_moe_model = True
+            if (architecture == 'Qwen3_5MoeForConditionalGeneration' or
+                model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text'):
+                is_thread_tp_moe_model = True
+            if (architecture == 'MiniMaxM2ForCausalLM' or model_type == 'minimax_m2'):
+                is_thread_tp_moe_model = True
+            if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
                     args.device = "cuda"
-                    args.moe_device = "cpu"
-                    if (usenuma):
-                        args.moe_device = "numa"
+                    if (not user_set_moe_device):
+                        args.moe_device = "cpu"
+                        if (usenuma):
+                            args.moe_device = "numa"
             if ("quantization_config" in config):
                 quantization_config = config["quantization_config"]
                 try:
@@ -165,6 +412,18 @@ def make_normal_llm_model(args):
                     pass
         except:
             pass
+    raw_tp_arg = getattr(args, "tp", "")
+    normalized_tp_arg = _normalize_thread_tp_arg(raw_tp_arg)
+    if raw_tp_arg != "" and normalized_tp_arg != raw_tp_arg:
+        args.tp = normalized_tp_arg
+    _explain_thread_tp_arg(raw_tp_arg, normalized_tp_arg)
+
+    if (_uses_thread_tp(getattr(args, "tp", ""))):
+        tp_device = _first_thread_tp_cuda_device(args.tp)
+        if (not user_set_device):
+            args.device = tp_device
+        if (not user_set_moe_device):
+            args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -195,6 +454,7 @@ def make_normal_llm_model(args):
             args.threads = max(1, min(32, os.cpu_count() - 2))
     if ("FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ):
         os.environ["FT_THREADS"] = str(args.threads)
+    atype_was_auto = (args.atype == "auto")
     if (args.atype == "auto"):
         if (args.device in ["cpu", "numa", "tfacc"]):
             args.atype = "float32"
@@ -202,12 +462,28 @@ def make_normal_llm_model(args):
         args.dtype = "float16"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    tp_arg = getattr(args, "tp", "")
+    if (tp_arg != ""):
+        os.environ["FASTLLM_TP"] = tp_arg
+        if (_uses_thread_tp(tp_arg)):
+            if (atype_was_auto):
+                args.atype = "float16"
+            if (not(args.device and args.device != "")):
+                args.device = _first_thread_tp_cuda_device(tp_arg)
+    if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
+        if (_uses_cuda_device(args.moe_device)):
+            args.moe_atype = "float16"
+        elif (_uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
     if (args.device and args.device != ""):
         expanded = expand_cudapp_device(args.device)
         if expanded != args.device:
             print(f"[device] cudapp expand: {args.device} => {expanded}")
             args.device = expanded
+    if (args.moe_device and args.moe_device != ""):
+        args.moe_device = expand_cudapp_device(args.moe_device)
     from ftllm import llm
+    llm.set_moe_device_layers(-1)
     if (args.device and args.device != ""):
         try:
             import ast
@@ -222,12 +498,30 @@ def make_normal_llm_model(args):
         try:
             import ast
             moe_device_map = ast.literal_eval(args.moe_device)
-            if (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
+            if (args.moe_device_layers >= 0):
+                front_moe_device = args.device
+                if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
+                    front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
+                llm.set_device_map(front_moe_device, True)
+                if (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
+                    llm.set_layered_moe_device_map(moe_device_map)
+                else:
+                    llm.set_layered_moe_device_map(args.moe_device)
+                llm.set_moe_device_layers(args.moe_device_layers)
+            elif (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
                 llm.set_device_map(moe_device_map, True)
             else:
                 llm.set_device_map(args.moe_device, True)
         except:
-            llm.set_device_map(args.moe_device, True)
+            if (args.moe_device_layers >= 0):
+                front_moe_device = args.device
+                if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
+                    front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
+                llm.set_device_map(front_moe_device, True)
+                llm.set_layered_moe_device_map(args.moe_device)
+                llm.set_moe_device_layers(args.moe_device_layers)
+            else:
+                llm.set_device_map(args.moe_device, True)
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding):
@@ -238,10 +532,15 @@ def make_normal_llm_model(args):
         llm.set_enable_amx(True)
     if (args.tokens > 0):
         llm.set_max_tokens(args.tokens)
+    apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    apply_prefix_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
+    if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
+        llm.set_cuda_slab(args.cuda_slab)
+    os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):
         import importlib.util

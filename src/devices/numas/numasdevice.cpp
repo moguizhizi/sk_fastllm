@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <thread>
 #include <mutex>
+#include <memory>
+#include <chrono>
 
 #include <cfloat>
 #include <climits>
@@ -37,6 +39,49 @@
 
 namespace fastllm {
     extern CPUInstructInfo *GetCPUInstructInfo();
+
+    static double NumasProfileNowMs() {
+        using Clock = std::chrono::steady_clock;
+        return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+    }
+
+    static void CopyTensorToCPU(const Data &src, Data &dst, const char *name) {
+        dst.dataType = src.dataType;
+        dst.Resize(src.dims);
+        dst.Allocate(false);
+
+        if (src.dataDevice == DataDevice::CPU && src.cpuData != nullptr) {
+            memcpy(dst.cpuData, src.cpuData, src.GetBytes());
+            return;
+        }
+
+#ifdef USE_CUDA
+        const Data *cudaSrc = &src;
+        int deviceId = src.dataDeviceIds.empty() ? FastllmCudaGetDevice() : src.dataDeviceIds[0];
+        if (src.multiDeviceData && !src.multiDeviceDatas.empty()) {
+            auto it = src.multiDeviceDatas.begin();
+            if (it->second != nullptr) {
+                deviceId = it->first;
+                cudaSrc = it->second;
+            }
+        }
+        if (cudaSrc != nullptr && cudaSrc->cudaData != nullptr) {
+            FastllmCudaSetDevice(deviceId);
+            FastllmCudaCopyFromDeviceToHost(dst.cpuData, cudaSrc->cudaData, dst.GetBytes());
+            return;
+        }
+#endif
+
+        ErrorInFastLLM(std::string("NumasMergeMOE: tensor ") + name + " has no readable CPU/CUDA data.\n");
+    }
+
+    static Data *GetCpuTensor(Data &src, Data &scratch, const char *name) {
+        if (src.dataDevice == DataDevice::CPU && src.cpuData != nullptr) {
+            return &src;
+        }
+        CopyTensorToCPU(src, scratch, name);
+        return &scratch;
+    }
 
     class MoeEnvConfig {
     public:
@@ -119,6 +164,7 @@ namespace fastllm {
         this->deviceType = "numa";
         // this->ops["Linear"] = (BaseOperator *) (new NumasLinearOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new NumasMergeMOE());
+        this->ops["FusedMOE"] = (BaseOperator*)(new NumasFusedMOE());
 
         /*this->ops["CatDirect"] = (BaseOperator *) (new NumaCatDirectOp());
         this->ops["Attention"] = (BaseOperator *) (new NumaAttention());
@@ -224,6 +270,73 @@ namespace fastllm {
                 float* scalePtr = (float*)(&fp8Packed[currentPos]);
                 *scalePtr = scales[scaleIdx];
                 currentPos += sizeof(float);
+            }
+        }
+    }
+
+    void Nvfp4ToFastllmNVFP4_BLOCK16(int experts, int k, int m, uint8_t *nvfp4, float *scales, uint8_t *scaleBytes,
+                                     int blockK, int blockM, std::vector<uint8_t> &nvfp4Packed) {
+        const int packBlockM = 16;
+        const int fp4BytesPerBlock = packBlockM / 2;
+        int scaleKs = (k - 1) / blockK + 1;
+        int scaleMs = (m - 1) / blockM + 1;
+        int packedBlocks = (m - 1) / packBlockM + 1;
+        size_t rawBytesPerRow = GetDataBytes(DataType::NVFP4, 1, m);
+        size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
+        nvfp4Packed.assign((size_t)experts * k * packedBytesPerRow, 0);
+
+        for (int e = 0; e < experts; e++) {
+            for (int row = 0; row < k; row++) {
+                uint8_t *dst = nvfp4Packed.data() + ((size_t)e * k + row) * packedBytesPerRow;
+                uint8_t *src = nvfp4 + ((size_t)e * k + row) * rawBytesPerRow;
+                for (int block = 0; block < packedBlocks; block++) {
+                    int blockStart = block * packBlockM;
+                    int blockElems = std::min(packBlockM, m - blockStart);
+                    int blockBytes = blockElems / 2;
+                    memcpy(dst, src + blockStart / 2, blockBytes);
+                    dst += fp4BytesPerBlock;
+
+                    int scaleCol = blockStart / blockM;
+                    size_t scaleIdx = (size_t)e * scaleKs * scaleMs + (row / blockK) * scaleMs + scaleCol;
+                    float scale = scales != nullptr ? scales[scaleIdx] : NVFP4E8M0ScaleToFloat(scaleBytes[scaleIdx]);
+                    memcpy(dst, &scale, sizeof(float));
+                    dst += sizeof(float);
+                }
+            }
+        }
+    }
+
+    static int GetCrossSwigluSourceRow(int dstRow, int k) {
+        int half = k / 2;
+        return (dstRow & 1) ? (half + dstRow / 2) : (dstRow / 2);
+    }
+
+    void Nvfp4ToFastllmNVFP4_BLOCK16_E8M0_Rows(
+        int k, int m, uint8_t *nvfp4, uint8_t *scaleBytes,
+        int blockK, int blockM, uint8_t *dst, int dstRowStart, int dstRows, bool isCrossSwiglu
+    ) {
+        const int packBlockM = 16;
+        const int fp4BytesPerBlock = packBlockM / 2;
+        const int scaleMs = (m - 1) / blockM + 1;
+        const int packedBlocks = (m - 1) / packBlockM + 1;
+        size_t rawBytesPerRow = GetDataBytes(DataType::NVFP4, 1, m);
+        size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16_E8M0, 1, m);
+
+        for (int localRow = 0; localRow < dstRows; localRow++) {
+            int dstRow = dstRowStart + localRow;
+            int srcRow = isCrossSwiglu ? GetCrossSwigluSourceRow(dstRow, k) : dstRow;
+            uint8_t *rowDst = dst + (size_t)localRow * packedBytesPerRow;
+            uint8_t *src = nvfp4 + (size_t)srcRow * rawBytesPerRow;
+            for (int block = 0; block < packedBlocks; block++) {
+                int blockStart = block * packBlockM;
+                int blockElems = std::min(packBlockM, m - blockStart);
+                int blockBytes = blockElems / 2;
+                memcpy(rowDst, src + blockStart / 2, blockBytes);
+                rowDst += fp4BytesPerBlock;
+
+                int scaleCol = blockStart / blockM;
+                size_t scaleIdx = (size_t)(srcRow / blockK) * scaleMs + scaleCol;
+                *rowDst++ = scaleBytes[scaleIdx];
             }
         }
     }
@@ -349,10 +462,102 @@ namespace fastllm {
         }
     }
 
+    #ifdef USE_CUDA
+    struct FastllmCudaHostFreeDeleter {
+        void operator()(void *ptr) const {
+            if (ptr != nullptr) {
+                FastllmCudaHostFree(ptr);
+            }
+        }
+    };
+
+    struct FastllmCudaFreeDeleter {
+        void operator()(void *ptr) const {
+            if (ptr != nullptr) {
+                FastllmCudaFree(ptr);
+            }
+        }
+    };
+
+    struct FastllmCudaStreamDestroyDeleter {
+        int device = -1;
+
+        void operator()(void *stream) const {
+            if (stream == nullptr) {
+                return;
+            }
+            int oriDevice = FastllmCudaGetDevice();
+            if (device >= 0 && oriDevice != device) {
+                FastllmCudaSetDevice(device);
+            }
+            FastllmCudaStreamDestroy(stream);
+            if (device >= 0 && oriDevice != device) {
+                FastllmCudaSetDevice(oriDevice);
+            }
+        }
+    };
+    #endif
+
     struct FastllmMoeDataManagerNumas {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <float, alignedAllocator<float, 64> > inputFloat32;  // 当 input 非 FLOAT32 时暂存转成 float32 的数据
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
+    #ifdef USE_CUDA
+            std::unique_ptr<void, FastllmCudaHostFreeDeleter> pinnedOutput {nullptr};
+            size_t pinnedOutputBytes = 0;
+            std::unique_ptr<void, FastllmCudaFreeDeleter> gpuOutputStaging {nullptr};
+            size_t gpuOutputStagingBytes = 0;
+            int gpuOutputStagingDevice = -1;
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> gpuOutputCopyStream {
+                nullptr, FastllmCudaStreamDestroyDeleter {}
+            };
+
+            uint8_t *EnsurePinnedOutput(size_t bytes) {
+                if (pinnedOutputBytes < bytes || pinnedOutput.get() == nullptr) {
+                    pinnedOutput.reset(FastllmCudaHostMalloc(bytes));
+                    pinnedOutputBytes = bytes;
+                }
+                return (uint8_t*)pinnedOutput.get();
+            }
+
+            void *EnsureGpuOutputStaging(size_t bytes, int gpuId) {
+                if (gpuOutputStagingDevice != gpuId) {
+                    gpuOutputStaging.reset(nullptr);
+                    gpuOutputStagingBytes = 0;
+                    gpuOutputStagingDevice = gpuId;
+                }
+                if (gpuOutputStagingBytes < bytes || gpuOutputStaging.get() == nullptr) {
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    gpuOutputStaging.reset(FastllmCudaMalloc(bytes));
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                    gpuOutputStagingBytes = bytes;
+                }
+                return gpuOutputStaging.get();
+            }
+
+            void *EnsureGpuOutputCopyStream(int gpuId) {
+                if (gpuOutputCopyStream.get() == nullptr ||
+                    gpuOutputCopyStream.get_deleter().device != gpuId) {
+                    gpuOutputCopyStream.reset(nullptr);
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    gpuOutputCopyStream = std::unique_ptr<void, FastllmCudaStreamDestroyDeleter>(
+                        FastllmCudaStreamCreate(true), FastllmCudaStreamDestroyDeleter {gpuId}
+                    );
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                }
+                return gpuOutputCopyStream.get();
+            }
+    #endif
     };
     // 每层一个 MoE 缓存，避免层间共享导致的数据竞争
     std::unordered_map<int, FastllmMoeDataManagerNumas> fastllmMoeDataManagerNumasPerLayer;
@@ -416,7 +621,11 @@ namespace fastllm {
             } else {
                 data->Repack();
 
-                if (data->dataType == DataType::FLOAT32 || data->dataType == DataType::BFLOAT16 || data->dataType == DataType::FLOAT16) {
+                if (data->dataType == DataType::FLOAT32 ||
+                    data->dataType == DataType::BFLOAT16 ||
+                    data->dataType == DataType::FLOAT16 ||
+                    data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                    data->dataType == DataType::FP8_E4M3_PERCHANNEL) {
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
                     uint8_t *srcData = data->cpuData;
                     std::vector<uint8_t> reordered;
@@ -449,6 +658,39 @@ namespace fastllm {
                     for (int i = 0; i < numaConfig->numaCnt; i++) {
                         data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
                         memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    }
+                } else if (data->dataType == DataType::NVFP4) {
+                    if (data->blockM < 16 || (data->blockM % 16 != 0 && data->blockM != m)) {
+                        ErrorInFastLLM("RegisterNumas can't support nvfp4 with blockM = " + std::to_string(data->blockM));
+                    }
+                    float *scaleFloats = data->scales.empty() ? nullptr : data->scales.data();
+                    uint8_t *scaleBytes = GetNVFP4ScaleData(*data);
+                    AssertInFastLLM(scaleFloats != nullptr || scaleBytes != nullptr,
+                                    "RegisterNumas can't find nvfp4 scale data.");
+                    if (scaleBytes != nullptr) {
+                        data->dataType = DataType::NVFP4_BLOCK_16_E8M0;
+                        size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16_E8M0, 1, m);
+                        for (int i = 0; i < numaConfig->numaCnt; i++) {
+                            data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * packedBytesPerRow, i);
+                            Nvfp4ToFastllmNVFP4_BLOCK16_E8M0_Rows(
+                                k, m, (uint8_t*)data->cpuData, scaleBytes, data->blockK, data->blockM,
+                                data->numasData[i], i * kPerNuma, kPerNuma, isCrossSwiglu
+                            );
+                        }
+                    } else {
+                        std::vector<uint8_t> nvfp4Packed;
+                        Nvfp4ToFastllmNVFP4_BLOCK16(1, k, m, (uint8_t*)data->cpuData, scaleFloats, scaleBytes, data->blockK, data->blockM, nvfp4Packed);
+                        data->dataType = DataType::NVFP4_BLOCK_16;
+                        size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
+                        if (isCrossSwiglu) {
+                            std::vector<uint8_t> reordered;
+                            CrossSwigluReorder(nvfp4Packed.data(), k, packedBytesPerRow, reordered);
+                            nvfp4Packed.swap(reordered);
+                        }
+                        for (int i = 0; i < numaConfig->numaCnt; i++) {
+                            data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * packedBytesPerRow, i);
+                            memcpy(data->numasData[i], nvfp4Packed.data() + (size_t)i * kPerNuma * packedBytesPerRow, kPerNuma * packedBytesPerRow);
+                        }
                     }
                 } else if (data->dataType == DataType::INT8) {
                     std::vector <uint8_t> int8Packed;
@@ -509,11 +751,22 @@ namespace fastllm {
                     ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
                 }
             }
+            data->expansionBytes = data->GetBytes();
             data->isPinned = usePinned;
         }
 
         delete[] data->cpuData;
         data->cpuData = nullptr;
+    }
+
+    static DataType GetNumasLinearActDataType(Data *weight, int batchSize) {
+        if (weight != nullptr &&
+            (weight->dataType == DataType::NVFP4 ||
+             weight->dataType == DataType::NVFP4_BLOCK_16 ||
+             weight->dataType == DataType::NVFP4_BLOCK_16_E8M0)) {
+            return DataType::BFLOAT16;
+        }
+        return weight->GetLinearActDataType(batchSize);
     }
 
     struct NumaWorkStealingOp : MultiThreadBaseOp {
@@ -696,7 +949,8 @@ namespace fastllm {
         float sharedScale,
         int weightsBatch, int topk,
         const std::unordered_set<int> &cpuExperts,
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas,
+        uint8_t *cpuOutputBuffer
     );
 
     struct MoeBenchmarkShapeKey {
@@ -990,7 +1244,7 @@ namespace fastllm {
                     for (int i = 0; i < warmupRounds; i++) {
                         DoNumasMergeMOEOnCPU(
                             benchInput, cpuOutput, benchIndexK, benchScoreK, weights, biass,
-                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager
+                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager, nullptr
                         );
                     }
                     double cpuElapsed = 0.0;
@@ -998,7 +1252,7 @@ namespace fastllm {
                         auto st = std::chrono::steady_clock::now();
                         DoNumasMergeMOEOnCPU(
                             benchInput, cpuOutput, benchIndexK, benchScoreK, weights, biass,
-                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager
+                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager, nullptr
                         );
                         auto ed = std::chrono::steady_clock::now();
                         cpuElapsed += std::chrono::duration<double, std::micro>(ed - st).count();
@@ -1057,7 +1311,8 @@ namespace fastllm {
         float sharedScale,
         int weightsBatch, int topk,
         const std::unordered_set<int> &cpuExperts,
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas,
+        uint8_t *cpuOutputBuffer
     ) {
         int bs = input.dims[0];
         int m = weightsBatch / 2 - 1; // num experts
@@ -1089,8 +1344,8 @@ namespace fastllm {
             }
         }
 
-        DataType startDataType = weights[2]->GetLinearActDataType(bs);
-        DataType downInputDataType = weights[3]->GetLinearActDataType(bs);
+        DataType startDataType = GetNumasLinearActDataType(weights[2], bs);
+        DataType downInputDataType = GetNumasLinearActDataType(weights[3], bs);
 
         // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
         auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -1380,6 +1635,8 @@ namespace fastllm {
             }
         } */
 
+        uint8_t *finalCpuOutput = cpuOutputBuffer != nullptr ? cpuOutputBuffer : (uint8_t*)output.cpuData;
+
         // 6. reduce
         {
             // 计算每个样本选择的专家数 k
@@ -1415,7 +1672,7 @@ namespace fastllm {
             }
 
             // 有一些token不会被关联到任何专家，也需要先清零
-            float *lastOutput = output.dataType == DataType::FLOAT32 ? (float*)output.cpuData : reduceOutput.data();
+            float *lastOutput = output.dataType == DataType::FLOAT32 ? (float*)finalCpuOutput : reduceOutput.data();
             memset(lastOutput, 0, bs * dim * sizeof(float));
 
             // 调用多线程函数
@@ -1434,13 +1691,267 @@ namespace fastllm {
         // 7. reduceOutput -> last Output
         if (output.dataType != DataType::FLOAT32) {
             if (output.dataType == DataType::FLOAT16) {
-                RunMultiThreadConvertFromFloat32((uint16_t*)output.cpuData, DataType::FLOAT16, 
+                RunMultiThreadConvertFromFloat32((uint16_t*)finalCpuOutput, DataType::FLOAT16, 
                     reduceOutput.data(), bs, dim, GetAlivePool());
             } else if (output.dataType == DataType::BFLOAT16) {
-                RunMultiThreadConvertFromFloat32((uint16_t*)output.cpuData, DataType::BFLOAT16, 
+                RunMultiThreadConvertFromFloat32((uint16_t*)finalCpuOutput, DataType::BFLOAT16, 
                     reduceOutput.data(), bs, dim, GetAlivePool());
             }
         }
+    }
+
+    struct NumasFusedMoeLayerWeights {
+        Data *gateSource = nullptr;
+        Data *upSource = nullptr;
+        Data *downSource = nullptr;
+        int experts = 0;
+        int inter = 0;
+        int hidden = 0;
+        DataType gateType = DataType::FLOAT32;
+        DataType downType = DataType::FLOAT32;
+        std::vector<std::unique_ptr<Data> > ownedWeights;
+        std::vector<Data*> weights;
+        std::vector<Data*> biass;
+
+        bool IsReadyFor(Data &gate, Data &up, Data &down) const {
+            return gateSource == &gate && upSource == &up && downSource == &down &&
+                   experts > 0 && inter > 0 && hidden > 0 &&
+                   gate.dims.size() == 3 && up.dims.size() == 3 && down.dims.size() == 3 &&
+                   gate.dims[0] == experts && gate.dims[1] == inter && gate.dims[2] == hidden &&
+                   up.dims[0] == experts && up.dims[1] == inter && up.dims[2] == hidden &&
+                   down.dims[0] == experts && down.dims[1] == hidden && down.dims[2] == inter &&
+                   gate.dataType == gateType && up.dataType == gateType && down.dataType == downType &&
+                   weights.size() == (size_t)(experts + 1) * 2;
+        }
+    };
+
+    static std::unordered_map<int, NumasFusedMoeLayerWeights> fastllmNumasFusedMoeWeightsPerLayer;
+
+    static void CopyNumasFusedLinearMeta(Data &dst, const Data &src, const std::string &name) {
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.tpLinearType = src.tpLinearType;
+        dst.tpPackType = src.tpPackType;
+    }
+
+    static void EnsureNumasFusedWeightCpuData(Data &weight, const char *name) {
+        if (weight.cpuData != nullptr) {
+            return;
+        }
+#ifdef USE_CUDA
+        if (weight.cudaData != nullptr) {
+            weight.ToDevice(DataDevice::CPU);
+            if (weight.cpuData != nullptr) {
+                return;
+            }
+        }
+#endif
+        ErrorInFastLLM(std::string("NumasFusedMOE: fused weight ") + name + " has no CPU data.\n");
+    }
+
+    static void AppendNumasFusedFp8Scales(Data &dst, const Data &src,
+                                          int expert, int srcRowStart, int rows) {
+        if (src.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(src.dims.size() == 3 && src.blockK > 0 && src.blockM > 0 &&
+                        !src.scales.empty(),
+                        "NumasFusedMOE FP8 source scales are missing.\n");
+        int rowsPerExpert = src.dims[1];
+        int cols = src.dims[2];
+        int scaleCols = (cols - 1) / src.blockM + 1;
+        int scaleRowsPerExpert = (rowsPerExpert - 1) / src.blockK + 1;
+        int scaleRowStart = srcRowStart / src.blockK;
+        int scaleRows = (rows - 1) / src.blockK + 1;
+        size_t srcOffset = ((size_t)expert * scaleRowsPerExpert + scaleRowStart) * scaleCols;
+        size_t count = (size_t)scaleRows * scaleCols;
+        AssertInFastLLM(expert >= 0 && expert < src.dims[0] &&
+                        srcRowStart >= 0 && rows > 0 && srcRowStart + rows <= rowsPerExpert &&
+                        srcRowStart % src.blockK == 0 &&
+                        srcOffset + count <= src.scales.size(),
+                        "NumasFusedMOE FP8 scale slice is out of bounds.\n");
+        dst.scales.insert(dst.scales.end(),
+                          src.scales.begin() + srcOffset,
+                          src.scales.begin() + srcOffset + count);
+    }
+
+    static void CopyNumasFusedRows(Data &dst, int dstRowStart,
+                                   Data &src, int expert, int srcRowStart, int rows) {
+        AssertInFastLLM(src.dims.size() == 3 && dst.dims.size() == 2,
+                        "NumasFusedMOE row copy expects 3D source and 2D destination.\n");
+        int rowsPerExpert = src.dims[1];
+        int cols = src.dims[2];
+        AssertInFastLLM(dst.dims[1] == cols &&
+                        expert >= 0 && expert < src.dims[0] &&
+                        srcRowStart >= 0 && rows > 0 && srcRowStart + rows <= rowsPerExpert &&
+                        dstRowStart >= 0 && dstRowStart + rows <= dst.dims[0],
+                        "NumasFusedMOE row copy shape mismatch.\n");
+        EnsureNumasFusedWeightCpuData(src, src.name.c_str());
+        size_t bytesPerRow = GetDataBytes(src.dataType, 1, cols);
+        memcpy(dst.cpuData + (size_t)dstRowStart * bytesPerRow,
+               src.cpuData + ((size_t)expert * rowsPerExpert + srcRowStart) * bytesPerRow,
+               (size_t)rows * bytesPerRow);
+    }
+
+    static NumasFusedMoeLayerWeights &GetNumasFusedMoeLayerWeights(
+        int layer, Data &gate, Data &up, Data &down
+    ) {
+        AssertInFastLLM(gate.dims.size() == 3 && up.dims.size() == 3 && down.dims.size() == 3,
+                        "NumasFusedMOE expects 3D fused weights.\n");
+        int experts = gate.dims[0];
+        int inter = gate.dims[1];
+        int hidden = gate.dims[2];
+        AssertInFastLLM(experts > 0 && inter > 0 && hidden > 0 &&
+                        up.dims[0] == experts && up.dims[1] == inter && up.dims[2] == hidden &&
+                        down.dims[0] == experts && down.dims[1] == hidden && down.dims[2] == inter &&
+                        gate.dataType == up.dataType,
+                        "NumasFusedMOE fused weight shapes mismatch.\n");
+
+        auto &cache = fastllmNumasFusedMoeWeightsPerLayer[layer];
+        if (cache.IsReadyFor(gate, up, down)) {
+            return cache;
+        }
+
+        cache = NumasFusedMoeLayerWeights();
+        cache.gateSource = &gate;
+        cache.upSource = &up;
+        cache.downSource = &down;
+        cache.experts = experts;
+        cache.inter = inter;
+        cache.hidden = hidden;
+        cache.gateType = gate.dataType;
+        cache.downType = down.dataType;
+        cache.weights.assign((size_t)(experts + 1) * 2, nullptr);
+        cache.biass.assign((size_t)(experts + 1) * 2, nullptr);
+        cache.ownedWeights.reserve((size_t)experts * 2);
+
+        for (int expert = 0; expert < experts; expert++) {
+            std::unique_ptr<Data> gateup(new Data(gate.dataType, {inter * 2, hidden}));
+            CopyNumasFusedLinearMeta(*gateup, gate, gate.name + ".numas.gateup." + std::to_string(expert));
+            gateup->tpLinearType = TP_LINEAR_ROW;
+            gateup->tpPackType = TP_PACK_GATEUP;
+            gateup->Allocate(false);
+            gateup->scales.clear();
+            CopyNumasFusedRows(*gateup, 0, gate, expert, 0, inter);
+            CopyNumasFusedRows(*gateup, inter, up, expert, 0, inter);
+            AppendNumasFusedFp8Scales(*gateup, gate, expert, 0, inter);
+            AppendNumasFusedFp8Scales(*gateup, up, expert, 0, inter);
+            RegisterNumas(gateup.get(), "linearSwiglu");
+
+            std::unique_ptr<Data> downWeight(new Data(down.dataType, {hidden, inter}));
+            CopyNumasFusedLinearMeta(*downWeight, down, down.name + ".numas.down." + std::to_string(expert));
+            downWeight->tpLinearType = TP_LINEAR_COLUMN;
+            downWeight->Allocate(false);
+            downWeight->scales.clear();
+            CopyNumasFusedRows(*downWeight, 0, down, expert, 0, hidden);
+            AppendNumasFusedFp8Scales(*downWeight, down, expert, 0, hidden);
+            RegisterNumas(downWeight.get(), "linearColumn");
+
+            cache.weights[(expert + 1) * 2] = gateup.get();
+            cache.weights[(expert + 1) * 2 + 1] = downWeight.get();
+            cache.ownedWeights.push_back(std::move(gateup));
+            cache.ownedWeights.push_back(std::move(downWeight));
+        }
+
+        return cache;
+    }
+
+    bool NumasFusedMOE::CanRun(const std::string &opType, const DataDict &datas,
+                               const FloatDict &floatParams, const IntDict &intParams) {
+        auto gateIt = datas.find("gate");
+        auto upIt = datas.find("up");
+        auto downIt = datas.find("down");
+        if (gateIt == datas.end() || upIt == datas.end() || downIt == datas.end()) {
+            return false;
+        }
+        Data *gate = gateIt->second;
+        Data *up = upIt->second;
+        Data *down = downIt->second;
+        return gate != nullptr && up != nullptr && down != nullptr &&
+               gate->dims.size() == 3 && up->dims.size() == 3 && down->dims.size() == 3 &&
+               gate->dataType == up->dataType &&
+               (gate->dataType == DataType::FP8_E4M3 ||
+                gate->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                gate->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                gate->dataType == DataType::FLOAT32 ||
+                gate->dataType == DataType::FLOAT16 ||
+                gate->dataType == DataType::BFLOAT16) &&
+               (down->dataType == gate->dataType ||
+                down->dataType == DataType::FP8_E4M3 ||
+                down->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                down->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                down->dataType == DataType::FLOAT32 ||
+                down->dataType == DataType::FLOAT16 ||
+                down->dataType == DataType::BFLOAT16);
+    }
+
+    void NumasFusedMOE::Reshape(const std::string &opType, const DataDict &datas,
+                                const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &gate = *(datas.find("gate")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = input.dataType;
+        output.Resize(input.dims);
+        if (index.dims.size() >= 2 && gate.dims.size() == 3) {
+            w1.dataType = input.dataType;
+            w1.Resize({(int)index.Count(0), gate.dims[1]});
+        }
+    }
+
+    void NumasFusedMOE::Run(const std::string &opType, const DataDict &datas,
+                            const FloatDict &floatParams, const IntDict &intParams) {
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType)intParams.find("gateType")->second : MoeGateSwiglu;
+        if (gateType != MoeGateSwiglu) {
+            ErrorInFastLLM("NumasFusedMOE only supports swiglu gate type.\n");
+        }
+        float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
+            floatParams.find("swigluLimit")->second : 0.0f;
+        if (swigluLimit != 0.0f) {
+            ErrorInFastLLM("NumasFusedMOE does not support non-zero swigluLimit.\n");
+        }
+
+        Data &rawInput = *(datas.find("input")->second);
+        Data cpuInput;
+        Data &input = *GetCpuTensor(rawInput, cpuInput, "input");
+        Data &rawIndex = *(datas.find("index")->second);
+        Data &rawScore = *(datas.find("score")->second);
+        Data cpuIndex, cpuScore;
+        Data &index = *GetCpuTensor(rawIndex, cpuIndex, "index");
+        Data &score = *GetCpuTensor(rawScore, cpuScore, "score");
+        Data &gate = *(datas.find("gate")->second);
+        Data &up = *(datas.find("up")->second);
+        Data &down = *(datas.find("down")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
+        auto &layerWeights = GetNumasFusedMoeLayerWeights(layer, gate, up, down);
+        FastllmMoeDataManagerNumas &manager = fastllmMoeDataManagerNumasPerLayer[layer % 2];
+
+        output.dataType = input.dataType;
+        output.expansionDims.clear();
+        output.Resize(input.dims);
+        output.Allocate();
+
+        int topk = index.dims.size() >= 2 ? index.dims[1] : 1;
+        std::unordered_set<int> cpuExperts;
+        for (int expert = 1; expert <= layerWeights.experts; expert++) {
+            cpuExperts.insert(expert);
+        }
+        DoNumasMergeMOEOnCPU(
+            input, output, index, score,
+            layerWeights.weights.data(), layerWeights.biass.data(),
+            1.0f, (int)layerWeights.weights.size(), topk,
+            cpuExperts, manager, nullptr
+        );
     }
 
     void NumasMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -1449,10 +1960,15 @@ namespace fastllm {
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;
   auto st = std::chrono::system_clock::now();
-        Data &input = *(datas.find("input")->second);
+        Data &rawInput = *(datas.find("input")->second);
+        Data cpuInput;
+        Data &input = *GetCpuTensor(rawInput, cpuInput, "input");
         Data &output = *(datas.find("output")->second);
-        Data &index = *(datas.find("index")->second);
-        Data &score = *(datas.find("score")->second);
+        Data &rawIndex = *(datas.find("index")->second);
+        Data &rawScore = *(datas.find("score")->second);
+        Data cpuIndex, cpuScore;
+        Data &index = *GetCpuTensor(rawIndex, cpuIndex, "index");
+        Data &score = *GetCpuTensor(rawScore, cpuScore, "score");
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
@@ -1466,10 +1982,34 @@ namespace fastllm {
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
         int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
         FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas = fastllmMoeDataManagerNumasPerLayer[layer % 2];
+        // `moeFinal` is reused across layers and may have been reshaped back to
+        // `[batch, seq, hidden]` by the caller. Reset it to the flattened MoE
+        // input shape here before the NUMA path reads `output.dims[1]`.
+        output.dataType = input.dataType;
+        output.expansionDims.clear();
+        output.Resize(input.dims);
         output.Allocate();
 // printf("allocate spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         int32_t *indexData = (int32_t*)index.cpuData;
         float *scoreData = (float*)score.cpuData;
+
+        bool profileDetail = std::getenv("FASTLLM_PROFILE_DETAIL") != nullptr &&
+                             (std::getenv("FASTLLM_PROFILE") != nullptr ||
+                              std::getenv("FASTLLM_PROFILE_DEEPSEEKV4") != nullptr ||
+                              std::getenv("FASTLLM_PROFILE_NUMAS_MOE") != nullptr);
+        double profileLast = NumasProfileNowMs();
+        double profileRegisterMs = 0.0, profileResizeMs = 0.0, profileInputMs = 0.0;
+        double profileGatePrepMs = 0.0, profileGateMs = 0.0, profileSwigluConvertMs = 0.0;
+        double profileDownPrepMs = 0.0, profileDownMs = 0.0, profileReduceMs = 0.0, profileOutputMs = 0.0;
+        int profileExpertCalls = 0;
+        auto profileLap = [&](double &bucket) {
+            if (!profileDetail) {
+                return;
+            }
+            double now = NumasProfileNowMs();
+            bucket += now - profileLast;
+            profileLast = now;
+        };
 
         if (input.dims[0] < 32) {
 // auto st = std::chrono::system_clock::now();
@@ -1485,6 +2025,9 @@ namespace fastllm {
                 int outputDim = output.dims[1];
 
                 for (int o = 0; o < bs; o++) {
+                    if (profileDetail) {
+                        profileLast = NumasProfileNowMs();
+                    }
                     std::vector <std::pair <int, float> > v;
                     for (int j = 0; j < topk; j++) {
                         // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
@@ -1496,8 +2039,23 @@ namespace fastllm {
                         v.push_back(std::make_pair(0, sharedScale));
                     }
 
-                    DataType startDataType = weights[2]->GetLinearActDataType(1);
-                    DataType downInputDataType = weights[3]->GetLinearActDataType(1);
+                    for (auto &expert : v) {
+                        int e = expert.first;
+                        if (weights[e * 2] == nullptr || weights[e * 2 + 1] == nullptr) {
+                            ErrorInFastLLM("NumasMergeMOE small batch: missing expert weight.\n");
+                        }
+                        if (weights[e * 2]->numasData.empty() && weights[e * 2]->cpuData != nullptr) {
+                            RegisterNumas(weights[e * 2], "linearSwiglu");
+                        }
+                        if (weights[e * 2 + 1]->numasData.empty() && weights[e * 2 + 1]->cpuData != nullptr) {
+                            RegisterNumas(weights[e * 2 + 1], "linearColumn");
+                        }
+                    }
+                    profileExpertCalls += (int)v.size();
+                    profileLap(profileRegisterMs);
+
+                    DataType startDataType = GetNumasLinearActDataType(weights[2], 1);
+                    DataType downInputDataType = GetNumasLinearActDataType(weights[3], 1);
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -1539,6 +2097,7 @@ namespace fastllm {
                     if (reduceOutput.size() < reduceOutputSize) {
                         reduceOutput.resize(reduceOutputSize);
                     }
+                    profileLap(profileResizeMs);
 
 // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
@@ -1561,6 +2120,7 @@ namespace fastllm {
                         }
                         RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, inputF32Ptr, 1, inputDim, GetAlivePool());
                     }
+                    profileLap(profileInputMs);
 // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 1. gateUp + swiglu (融合算子)
@@ -1618,6 +2178,9 @@ namespace fastllm {
                                 // 仅当 downInputDataType 支持直接转换时，才传 dstOutputData
                                 uint8_t *dstPtr = canFuseDstConvert ?
                                     (uint8_t*)downInput.data() + expertIdx * GetDataBytes(downInputDataType, 1, interDim) : nullptr;
+                                AssertInFastLLM((int)weights[e * 2]->numasData.size() > nid &&
+                                                weights[e * 2]->numasData[nid] != nullptr,
+                                                "NumasMergeMOE small batch gate weight missing NUMA shard: " + weights[e * 2]->name + "\n");
                                 ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
                                     new MultiThreadGemmAndCrossSwigluOp(
                                         (uint8_t*)realInput.data(), startDataType,
@@ -1640,6 +2203,7 @@ namespace fastllm {
                             currentRow = endRow;
                         }
                     }
+                    profileLap(profileGatePrepMs);
 // printf("gateup+swiglu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
                         pool->PushOp(i, ops[i]);
@@ -1649,6 +2213,7 @@ namespace fastllm {
                         pool->Wait(i);
                         delete ops[i];
                     }
+                    profileLap(profileGateMs);
 
 // printf("gateup+swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
@@ -1664,6 +2229,7 @@ namespace fastllm {
                                 1, interDim, GetAlivePool());
                         }
                     }
+                    profileLap(profileSwigluConvertMs);
 
                     // 5. down
                     ops.resize(numaConfig->threads);
@@ -1704,6 +2270,9 @@ namespace fastllm {
                                     size_t outputOffset = GetDataBytes(DataType::FLOAT32, expertIdx, k) + 
                                                         GetDataBytes(DataType::FLOAT32, 1, base);
                                     
+                                    AssertInFastLLM((int)weights[e * 2 + 1]->numasData.size() > nid &&
+                                                    weights[e * 2 + 1]->numasData[nid] != nullptr,
+                                                    "NumasMergeMOE small batch down weight missing NUMA shard: " + weights[e * 2 + 1]->name + "\n");
                                     ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
                                         new MultiThreadGemmOp(
                                             (uint8_t*)downInput.data() + inputOffset, downInputDataType,
@@ -1720,6 +2289,7 @@ namespace fastllm {
                             currentRow = endRow;
                         }
                     }
+                    profileLap(profileDownPrepMs);
 
 // printf("down prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
@@ -1729,6 +2299,7 @@ namespace fastllm {
                         pool->Wait(i);
                         delete ops[i];
                     }
+                    profileLap(profileDownMs);
 
 // printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     float *fLastOutput = reduceOutput.data();
@@ -1750,6 +2321,7 @@ namespace fastllm {
                             }
                         }
                     }
+                    profileLap(profileReduceMs);
 
 // printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 7. reduceOutput -> last Output
@@ -1760,7 +2332,18 @@ namespace fastllm {
                             Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData + o * outputDim, outputDim);
                         }
                     }
+                    profileLap(profileOutputMs);
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                }
+                if (profileDetail) {
+                    double total = profileRegisterMs + profileResizeMs + profileInputMs + profileGatePrepMs +
+                                   profileGateMs + profileSwigluConvertMs + profileDownPrepMs + profileDownMs +
+                                   profileReduceMs + profileOutputMs;
+                    printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f swiglu_convert=%.3f down_prep=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                           bs, topk, profileExpertCalls, profileRegisterMs, profileResizeMs, profileInputMs,
+                           profileGatePrepMs, profileGateMs, profileSwigluConvertMs, profileDownPrepMs,
+                           profileDownMs, profileReduceMs, profileOutputMs, total);
+                    fflush(stdout);
                 }
             }
         } else {
@@ -1825,16 +2408,22 @@ namespace fastllm {
 // printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
 // printf("prepare 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
+            uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
             if (gpuPrefill && cpuExperts.empty()) {
+                int gpuId = FastllmCudaGetDevice();
                 DoCudaMergeMOEFromCPU (
                     input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, gpuExperts, true
                 );
+                output.dataDevice = DataDevice::CUDA;
+                output.dataDeviceIds = {gpuId};
                 return;
             }
 
             int gpuId = FastllmCudaGetDevice();
             std::thread gpuThread;
+            void *cpuOutputStaging = nullptr;
+            void *cpuOutputCopyStream = nullptr;
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread = std::thread([&, gpuId, gpuExperts]() {
                     FastllmCudaSetDevice(gpuId);
@@ -1846,16 +2435,41 @@ namespace fastllm {
 // printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #endif
             if (!cpuExperts.empty()) {
+#ifdef USE_CUDA
+                if (gpuPrefill && !gpuExperts.empty()) {
+                    cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
+                }
+#endif
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
-                    sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas
+                    sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas, cpuOutputPinned
                 );
+#ifdef USE_CUDA
+                // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
+                if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
+                    FastllmCudaSetDevice(gpuId);
+                    size_t outputBytes = output.GetBytes();
+                    cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
+                    cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
+                    FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                        cpuOutputStaging, cpuOutputPinned, outputBytes, cpuOutputCopyStream
+                    );
+                }
+#endif
             }
 // printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread.join();
-                ReduceSumFromCPU(output);
+                FastllmCudaSetDevice(gpuId);
+                if (cpuOutputStaging != nullptr) {
+                    FastllmCudaStreamSynchronize(cpuOutputCopyStream);
+                    Data gpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, output.cudaData);
+                    Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
+                    FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
+                }
+                output.dataDevice = DataDevice::CUDA;
+                output.dataDeviceIds = {gpuId};
             }
 #endif
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));

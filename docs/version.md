@@ -1,3 +1,86 @@
+## V0.1.7.0
+
+- 新增终端部署向导和模型向导（ftllm即可执行）
+- 优化张量并行
+- 初步支持Qwen3.5 MTP解码
+- 支持Qwen3.5 MoE路径，修复Qwen3MoE异构TP及混合MoE设备路径
+- 修复Qwen3.5前缀缓存、空注意力分片和非CUDA编译问题
+- 支持Step3.7文本模型、视觉前向和多模态预处理
+- 初步支持CUDA Graph
+- 支持MoE混合推理的层数
+- 优化多卡按层切分平衡，修复多卡分页缓存分配和分页调度饿死问题
+- 支持SM60, SM70
+- 修复Qwen工具调用解析、cuBLAS句柄表并发竞争、CUDA分页注意力崩溃、分页缓存元数据及页数统计等问题
+- 修复logits结果生命周期和潜在内存泄漏问题
+- 更新混合推理文档
+
+## V0.1.6.4
+
+- 优化DeepSeek V4解码速度
+- 优化DeepSeek V4预填重速度
+- 优化DeepSeek V4并发速度
+- 优化DeepSeek V4 NVFP4算子的速度
+- DeepSeek V4模型支持多卡串行
+- 减少NVFP4模型的内存占用
+- 优化CUDA MOE速度
+- 支持多CUDA, NUMA, Disk一起混合推理
+- 支持Step3.5模型，补充Step3.5运行时和服务适配，优化Step3.5 MoE拆分与并发解码
+- 优化Qwen3.5批量解码吞吐
+
+## V0.1.6.3
+
+- 修复transformers 5.8.0升级后不兼容的bug
+- 增加`--cuda_slab`参数，可减少大量CUDA模型权重小块分配造成的显存碎片
+
+## V0.1.6.2
+
+- 支持磁盘MoE推理，补充磁盘设备后端和SSD读取速度测试工具
+- 优化GGUF磁盘MoE推理，修复磁盘MoE及FP8磁盘MoE加载问题
+- 支持DeepSeek V4思考输出, 可以使用参数--enable_thinking控制
+- 优化DeepSeek V4显存缓存拼接，修复解码缓存内存增长问题
+- 限制DeepSeek V4稀疏预填充临时显存，降低长上下文预填充显存峰值
+- 调整DeepSeek V4默认采样参数，默认使用top_k = 5
+
+## V0.1.6.1
+
+- 更新DeepSeek V4量化配置，补充Q2、Q4、UD-Q2_K_L、UD-Q2_K_M量化示例
+- 支持CUDA NVFP4线性计算
+- 支持CUDA Q2_K_R4反量化
+- 优化DeepSeek V4 compressedKV CUDA缓存，提升稀疏解码性能
+
+## V0.1.6.0
+
+- 支持DeepSeek V4模型，补充DeepSeek V4的分词和chat_template处理
+- 修复DeepSeek V4缺少chat_template时加载出错的问题
+- 修复DeepSeek V4工具调用解析的问题
+- 支持Qwen3.5多模态推理，补充Qwen3.5多模态Python接口
+- 支持Qwen3.5 MoE模型识别和默认参数设置
+- 初步支持Gemma4多模态推理
+- 支持Minimax-M2模型，补充Minimax-M2工具调用解析
+- 初步支持Anthropic API兼容接口，新增`/v1/messages`接口
+- 修复Anthropic API工具调用的问题
+- OpenAI兼容API支持图文输入，支持http、data url和file url图片
+- 修复多模态推理资源管理的问题
+- 支持参数`--kv_cache_dtype`设置KV缓存类型
+- 增加`--chunked_prefill_size`参数设置分块prefill大小
+- 增加`--tokens`、`--page_size`、`--gpu_mem_ratio`等参数，方便控制长上下文和缓存
+- 增加`--moe_atype`参数，可指定MOE层激活类型
+- 增加`--cuda_se`参数，可控制共享专家是否使用CUDA执行
+- 支持`cudapp=N`、`cudapp=1:2:3`形式简写多卡串行执行参数
+- API server支持读取模型默认采样参数
+- API server支持通过命令行覆盖temperature、top_p、top_k、repeat_penalty等采样参数
+- 修复API server中enable_thinking和think参数透传的问题
+- API server启动时会尝试提高ulimit，减少请求较多时文件描述符不足的问题
+- 新增`ftllm.env`模块，可读取当前wheel的编译信息
+- 优化Python包版本读取，支持从`ftllm`、`ftllm-nightly`、`ftllm-rocm`读取版本号
+- 优化CUDA wheel依赖库加载，支持从pip安装的nvidia依赖中查找CUDA、cuBLAS、NCCL库
+- CUDA wheel补充NCCL依赖和SM80预编译架构
+- 修复Python历史缓存的问题
+- 修复读取GGUF模型时未加载generation_config的问题
+- 修复CPU embedding、tie weight等模型加载问题
+- 修复tool parser在tokenizer缺失时可能出错的问题
+- 修复nightly打包元数据和Python包编译脚本相关问题
+
 ## V0.1.5.1
 
 - 初步支持AMX加速，在支持AMX的机器上通过参数--amx true来开启

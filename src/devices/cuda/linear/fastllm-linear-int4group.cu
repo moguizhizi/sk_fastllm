@@ -4,6 +4,10 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-awq-sm70.cuh"
+
+#include <cmath>
+#include <unordered_map>
 
 #if !defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 #include <cpuid.h>
@@ -209,7 +213,105 @@ __global__ void FastllmGemvHalfInt4GroupKernelMultiRow(half *A, uint8_t *B, half
     __syncthreads();
 }
 
+// 优化版本: 每个 warp 负责一行输出, 每个 lane 一次加载 8 个 INT4 权重字节 (uint2 = 16 个 nibble),
+// 使用 warp shuffle 归约, 去除 shared memory 与 __syncthreads。float 输入版本。
+// 参照 FP8 的 warp kernel。要求 m % 16 == 0 且 groupCnt % 16 == 0。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvFloatInt4GroupKernelWarpMultiRow(
+        const float * __restrict__ A, const uint8_t * __restrict__ B,
+        float * __restrict__ C, const float * __restrict__ bias,
+        const half * __restrict__ scales, const half * __restrict__ mins,
+        int m, int k, int group, int groupCnt) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const uint8_t *baseB = B + (size_t)st * (m / 2);
+    const half *rowScales = scales + (size_t)st * group;
+    const half *rowMins = mins + (size_t)st * group;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    const int numUnits = m >> 4;  // 每单元 16 个元素 (8 字节权重)
+    for (int u = laneId; u < numUnits; u += 32) {
+        const int i = u << 4;
+        const int g = i / groupCnt;
+        const float curScale = __half2float(__ldg(rowScales + g));
+        const float curMin = __half2float(__ldg(rowMins + g));
+
+        union_char8 bw;
+        bw.in = *reinterpret_cast<const uint2 *>(baseB + (size_t)u * 8);
+        float wval[16];
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const uint8_t byteVal = bw.out[b];
+            wval[b * 2]     = curMin + curScale * (float)(byteVal >> 4);
+            wval[b * 2 + 1] = curMin + curScale * (float)(byteVal & 15);
+        }
+
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            const float *Ax = A + (size_t)x * m + i;
+            float4 a0 = *reinterpret_cast<const float4 *>(Ax);
+            float4 a1 = *reinterpret_cast<const float4 *>(Ax + 4);
+            float4 a2 = *reinterpret_cast<const float4 *>(Ax + 8);
+            float4 a3 = *reinterpret_cast<const float4 *>(Ax + 12);
+            acc[x] += a0.x * wval[0]  + a0.y * wval[1]  + a0.z * wval[2]  + a0.w * wval[3]
+                    + a1.x * wval[4]  + a1.y * wval[5]  + a1.z * wval[6]  + a1.w * wval[7]
+                    + a2.x * wval[8]  + a2.y * wval[9]  + a2.z * wval[10] + a2.w * wval[11]
+                    + a3.x * wval[12] + a3.y * wval[13] + a3.z * wval[14] + a3.w * wval[15];
+        }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            C[st + (size_t)k * x] = acc[x] + bias[st];
+        }
+    }
+}
+
 void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float *output, float *bias, half *scales, half *mins, int n, int m, int k, int group, int groupCnt) {
+    // 满足 16 对齐时走 warp 优化版 GEMV (参照 FP8 warp kernel)。
+    if ((m & 15) == 0 && groupCnt > 0 && (groupCnt & 15) == 0) {
+        constexpr int W = 8;  // 每个 block 8 个 warp (256 线程)
+        const int grid = (k + W - 1) / W;
+#define FASTLLM_INT4G_WARP_LAUNCH_F32(PARTVAL, OFF) \
+        FastllmGemvFloatInt4GroupKernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+            input + (OFF) * m, weight, output + (OFF) * k, bias, scales, mins, m, k, group, groupCnt)
+        switch (n) {
+            case 1:  FASTLLM_INT4G_WARP_LAUNCH_F32(1, 0);  return;
+            case 2:  FASTLLM_INT4G_WARP_LAUNCH_F32(2, 0);  return;
+            case 3:  FASTLLM_INT4G_WARP_LAUNCH_F32(3, 0);  return;
+            case 4:  FASTLLM_INT4G_WARP_LAUNCH_F32(4, 0);  return;
+            case 5:  FASTLLM_INT4G_WARP_LAUNCH_F32(5, 0);  return;
+            case 6:  FASTLLM_INT4G_WARP_LAUNCH_F32(6, 0);  return;
+            case 7:  FASTLLM_INT4G_WARP_LAUNCH_F32(7, 0);  return;
+            case 8:  FASTLLM_INT4G_WARP_LAUNCH_F32(8, 0);  return;
+            default: break;
+        }
+        int i = 0;
+        for (; i + 7 < n; i += 8) FASTLLM_INT4G_WARP_LAUNCH_F32(8, i);
+        for (; i + 3 < n; i += 4) FASTLLM_INT4G_WARP_LAUNCH_F32(4, i);
+        for (; i + 1 < n; i += 2) FASTLLM_INT4G_WARP_LAUNCH_F32(2, i);
+        for (; i < n; i++)        FASTLLM_INT4G_WARP_LAUNCH_F32(1, i);
+#undef FASTLLM_INT4G_WARP_LAUNCH_F32
+        return;
+    }
+
     for (int i = 0; i < n; i++) {
 #ifdef CUDA_NO_TENSOR_CORE
         FastllmGemvInt4GroupKernel3<64, 4> <<< k / 4, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k, group, groupCnt);
@@ -219,11 +321,188 @@ void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float *output
     }
 }
 
-static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
-        cudaError_t state = cudaSuccess;
-        int group = weight.group;
+static constexpr int INT4GROUP_CUDA_SCALES_IDX = 0;
+static constexpr int INT4GROUP_CUDA_MINS_IDX = 1;
+static constexpr int INT4GROUP_CUDA_BIAS_IDX = 2;
+static constexpr int INT4GROUP_MARLIN_WEIGHT_IDX = 3;
+static constexpr int INT4GROUP_MARLIN_ZEROS_IDX = 4;
+static constexpr int INT4GROUP_MARLIN_WORKSPACE_IDX = 5;
 
+static constexpr int INT4GROUP_HALF_SCALES_IDX = 0;
+static constexpr int INT4GROUP_HALF_MINS_IDX = 1;
+static constexpr int INT4GROUP_HALF_BIAS_IDX = 2;
+static constexpr int INT4GROUP_MARLIN_SCALES_HALF_IDX = 3;
+
+// ==================== SM70 (V100) AWQ via TurboMind s884 ====================
+// Marlin 需要 sm_75+，在 V100 上不可用，INT4_GROUP 会退化为 dequant + cublas，
+// 速度与 FP8 无异。这里为 SM70 提供一条真正的 W4A16 GEMM 路径：把 INT4_GROUP
+// 权重重排为 TurboMind 所需的解包权重 / scale / zero，交由移植的 s884 内核计算。
+// Handle 为主机侧指针，不能放入 extraCudaData（会被 FastllmCudaFree），单独缓存。
+static std::unordered_map<const fastllm::Data*, void*> g_sm70AwqHandles;
+
+// 重排成功后释放原始 INT4_GROUP 权重，定义在后面，这里前置声明。
+static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight);
+
+// weight: [k, m] 每字节两个 nibble（输出在外、输入在内），偶数输入在高位。
+// 输出 out: [K=m, N=k] 行主序，out[in * k + outIdx] = 该 (输入 in, 输出 outIdx) 的 4bit 值。
+__global__ void FastllmInt4GroupToAwqU16Kernel(const uint8_t *weight, uint16_t *out, int m, int k) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)m * k;
+    if (idx >= total) {
+        return;
+    }
+    int in = (int)(idx / k);
+    int outIdx = (int)(idx - (size_t)in * k);
+    uint8_t byte = weight[(size_t)outIdx * (m / 2) + in / 2];
+    uint16_t q = (in & 1) ? (byte & 0xF) : (byte >> 4);
+    out[idx] = q;
+}
+
+static bool FastllmCudaInt4GroupSm70AwqEnabled(int n, int m, int k, int groupCnt) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    static const bool disabled = (getenv("FASTLLM_DISABLE_SM70_AWQ") != nullptr);
+    if (disabled) {
+        return false;
+    }
+    if (!fastllm::awq_sm70::Supported()) {
+        return false;
+    }
+    // K = m (输入维), N = k (输出维)，TurboMind 要求 K/N 为 8 的倍数，按 K 分组。
+    return groupCnt > 0 && (groupCnt == 32 || groupCnt == 64 || groupCnt == 128) &&
+           m % groupCnt == 0 && m % 8 == 0 && k % 8 == 0;
+#endif
+}
+
+static bool FastllmCudaInt4GroupEnsureSm70AwqOnDevice(fastllm::Data &weight, int m, int k) {
+    auto it = g_sm70AwqHandles.find(&weight);
+    if (it != g_sm70AwqHandles.end()) {
+        return it->second != nullptr;
+    }
+    int group = weight.group, groupCnt = weight.groupCnt;
+    if (weight.cudaData == nullptr || group <= 0 || groupCnt <= 0 ||
+        weight.scales.size() != (size_t)k * group ||
+        weight.mins.size() != (size_t)k * group) {
+        g_sm70AwqHandles[&weight] = nullptr;
+        return false;
+    }
+
+    const int K = m, N = k, numGroups = group;
+
+    uint16_t *dU16 = (uint16_t*)FastllmCudaMalloc((size_t)K * N * sizeof(uint16_t));
+    if (dU16 == nullptr) {
+        printf("FastllmAwqSm70 prepare error: FastllmCudaMalloc(dU16, %zu bytes) failed (likely OOM). m=%d k=%d\n",
+               (size_t)K * N * sizeof(uint16_t), m, k);
+        g_sm70AwqHandles[&weight] = nullptr;
+        return false;
+    }
+    size_t total = (size_t)K * N;
+    int threads = 256;
+    FastllmInt4GroupToAwqU16Kernel <<< (total + threads - 1) / threads, threads >>>(
+        (const uint8_t*)weight.cudaData, dU16, m, k);
+
+    std::vector<half> hScales((size_t)numGroups * N);
+    std::vector<half> hZeros((size_t)numGroups * N);
+    for (int g = 0; g < numGroups; g++) {
+        for (int nn = 0; nn < N; nn++) {
+            float s = weight.scales[(size_t)nn * group + g];
+            float mn = weight.mins[(size_t)nn * group + g];
+            int z = (s == 0.0f) ? 0 : (int)std::lroundf(-mn / s);
+            z = std::max(0, std::min(15, z));
+            hScales[(size_t)g * N + nn] = __float2half(s);
+            hZeros[(size_t)g * N + nn] = __float2half((float)z);
+        }
+    }
+    half *dScales = (half*)FastllmCudaMalloc(hScales.size() * sizeof(half));
+    half *dZeros = (half*)FastllmCudaMalloc(hZeros.size() * sizeof(half));
+    if (dScales == nullptr || dZeros == nullptr) {
+        printf("FastllmAwqSm70 prepare error: FastllmCudaMalloc(scales=%p zeros=%p) failed (likely OOM). "
+               "numGroups=%d N=%d\n", (void*)dScales, (void*)dZeros, numGroups, N);
+        FastllmCudaFree(dU16);
+        if (dScales) FastllmCudaFree(dScales);
+        if (dZeros) FastllmCudaFree(dZeros);
+        g_sm70AwqHandles[&weight] = nullptr;
+        return false;
+    }
+    FastllmCudaCopyFromHostToDevice(dScales, hScales.data(), hScales.size() * sizeof(half));
+    FastllmCudaCopyFromHostToDevice(dZeros, hZeros.data(), hZeros.size() * sizeof(half));
+
+    // dU16 已经从原始权重重排出量化值，scale/zero 也已拷到 device，原始 INT4_GROUP
+    // 权重（weight.cudaData）此后不再需要：GEMM 走 handle->tmWeight/tmScales。
+    // 这里在 Prepare 之前就释放，并用 FastllmCudaClearBigBuffer 把池中空闲显存真正
+    // 归还给 OS——Prepare 内部用的是原生 cudaMalloc，只能向 OS 申请显存。否则
+    // 原始权重虽被标记空闲仍滞留在 fastllm 显存池里，Prepare 仍会 OOM。
+    FastllmCudaInt4GroupReleaseOriginalWeight(weight);
+    FastllmCudaClearBigBuffer();
+
+    void *handle = fastllm::awq_sm70::Prepare(dU16, dScales, dZeros, K, N, numGroups, groupCnt, 0);
+
+    FastllmCudaFree(dU16);
+    FastllmCudaFree(dScales);
+    FastllmCudaFree(dZeros);
+
+    g_sm70AwqHandles[&weight] = handle;
+    return handle != nullptr;
+}
+
+static bool FastllmCudaInt4GroupHasMarlinOnDevice(const fastllm::Data &weight) {
+    return (int)weight.extraCudaData.size() > INT4GROUP_MARLIN_WORKSPACE_IDX &&
+           (int)weight.extraCudaHalfData.size() > INT4GROUP_MARLIN_SCALES_HALF_IDX &&
+           weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX] != nullptr &&
+           weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX] != nullptr &&
+           weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX] != nullptr &&
+           weight.extraCudaHalfData[INT4GROUP_MARLIN_SCALES_HALF_IDX] != nullptr;
+}
+
+static void FastllmCudaInt4GroupFallbackUnavailable() {
+    printf("Error: INT4_GROUP original CUDA weight was released after Marlin repack; fallback path is unavailable.\n");
+    throw("int4group marlin-only fallback error");
+    exit(0);
+}
+
+static void FastllmCudaInt4GroupReleaseExtraCudaData(fastllm::Data &weight, int index) {
+    if ((int)weight.extraCudaData.size() <= index || weight.extraCudaData[index] == nullptr) {
+        return;
+    }
+
+    void *ptr = weight.extraCudaData[index];
+    for (int i = 0; i < (int)weight.extraCudaHalfData.size(); i++) {
+        if (weight.extraCudaHalfData[i] == ptr) {
+            weight.extraCudaHalfData[i] = nullptr;
+        }
+    }
+    FastllmCudaFree(ptr);
+    weight.extraCudaData[index] = nullptr;
+}
+
+static void FastllmCudaInt4GroupReleaseFallbackCaches(fastllm::Data &weight) {
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_SCALES_IDX);
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_MINS_IDX);
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_BIAS_IDX);
+}
+
+static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight) {
+    if (weight.cudaData != nullptr) {
+        FastllmCudaFree(weight.cudaData);
+        weight.cudaData = nullptr;
+    }
+    FastllmCudaInt4GroupReleaseFallbackCaches(weight);
+}
+
+static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    if (weight.cudaData == nullptr) {
+        FastllmCudaInt4GroupFallbackUnavailable();
+    }
+
+    if ((int)weight.extraCudaData.size() <= INT4GROUP_CUDA_BIAS_IDX) {
+        weight.extraCudaData.resize(INT4GROUP_CUDA_BIAS_IDX + 1, nullptr);
+    }
+
+    cudaError_t state = cudaSuccess;
+    int group = weight.group;
+
+    if (weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX] == nullptr) {
         half *cudaScales;
         state = cudaMalloc(&cudaScales, k * group * sizeof(half));
         half *scales = new half[k * group];
@@ -231,9 +510,11 @@ static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &w
             scales[i] = (half)weight.scales[i];
         }
         state = cudaMemcpy(cudaScales, scales, k * group * sizeof(half), cudaMemcpyHostToDevice);
-        weight.extraCudaData.push_back((void*)cudaScales);
+        weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX] = (void*)cudaScales;
         delete[] scales;
+    }
 
+    if (weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX] == nullptr) {
         half *cudaMins;
         state = cudaMalloc(&cudaMins, k * group * sizeof(half));
         half *mins = new half[k * group];
@@ -242,8 +523,10 @@ static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &w
         }
         state = cudaMemcpy(cudaMins, mins, k * group * sizeof(half), cudaMemcpyHostToDevice);
         delete[] mins;
-        weight.extraCudaData.push_back((void*)cudaMins);
+        weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX] = (void*)cudaMins;
+    }
 
+    if (weight.extraCudaData[INT4GROUP_CUDA_BIAS_IDX] == nullptr) {
         float *cudaBiasData;
         state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
@@ -252,7 +535,7 @@ static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &w
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData.push_back((void*)cudaBiasData);
+        weight.extraCudaData[INT4GROUP_CUDA_BIAS_IDX] = (void*)cudaBiasData;
     }
 }
 
@@ -261,62 +544,75 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
     int group = weight.group, groupCnt = weight.groupCnt;
     FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
 
-    half *cudaScales = (half*)weight.extraCudaData[0];
-    half *cudaMins = (half*)weight.extraCudaData[1];
-    float *cudaBiasData = (float*)weight.extraCudaData[2];
+    half *cudaScales = (half*)weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX];
+    half *cudaMins = (half*)weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX];
+    float *cudaBiasData = (float*)weight.extraCudaData[INT4GROUP_CUDA_BIAS_IDX];
 
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
     if (n >= 8) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
+        half *cudaFp16Input, *cudaFp16Output;
 #ifdef CUDA_NO_TENSOR_CORE
-        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+        cudaFp16Input = (half *) FastllmCudaMalloc((size_t)n * m * sizeof(half));
 
         float h_alpha = 1.0, h_beta = 0.0;
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
 #else
-        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
-        cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+        cudaFp16Input = (half *) FastllmCudaMalloc((size_t)n * m * sizeof(half));
+        cudaFp16Output = (half *) FastllmCudaMalloc((size_t)n * k * sizeof(half));
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
 #endif
-        cublasStatus_t status;
+
+        // 借 workspace 作为 INT4 -> FP16 weight 的反量化临时缓冲，按 K 维分块
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
+        size_t bytesPerRow = (size_t)m * sizeof(half);
+        int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
         int len = n * m;
         int threadPerBlock = std::min(256, len);
         FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input,
                                                                                           len);
 
-        len = k * m;
-        FastllmCudaInt4Group2HalfKernel <<< k, 64 >>>((uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaFp16Weight, k, m, group, groupCnt);
+        for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+            int kc = std::min(maxRowsPerChunk, k - kOff);
+
+            FastllmCudaInt4Group2HalfKernel <<< kc, 64 >>>(
+                (uint8_t*)weight.cudaData + (size_t)kOff * m / 2,
+                cudaScales + (size_t)kOff * group,
+                cudaMins + (size_t)kOff * group,
+                cudaFp16Weight, kc, m, group, groupCnt);
 
 #ifdef CUDA_NO_TENSOR_CORE
-        status = cublasGemmEx(fastllmCublasHandle,
-                              CUBLAS_OP_T, CUBLAS_OP_N,
-                              k, n, m,
-                              &h_alpha, cudaFp16Weight, AType,
-                              m, cudaFp16Input, BType,
-                              m, &h_beta,
-                              cudaOutput, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            status = cublasGemmEx(fastllmCublasHandle,
+                                  CUBLAS_OP_T, CUBLAS_OP_N,
+                                  kc, n, m,
+                                  &h_alpha, cudaFp16Weight, AType,
+                                  m, cudaFp16Input, BType,
+                                  m, &h_beta,
+                                  cudaOutput + kOff, CType,
+                                  k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
-        status = cublasGemmEx(fastllmCublasHandle,
-                              CUBLAS_OP_T, CUBLAS_OP_N,
-                              k, n, m,
-                              &h_alpha, cudaFp16Weight, AType,
-                              m, cudaFp16Input, BType,
-                              m, &h_beta,
-                              cudaFp16Output, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            status = cublasGemmEx(fastllmCublasHandle,
+                                  CUBLAS_OP_T, CUBLAS_OP_N,
+                                  kc, n, m,
+                                  &h_alpha, cudaFp16Weight, AType,
+                                  m, cudaFp16Input, BType,
+                                  m, &h_beta,
+                                  cudaFp16Output + kOff, CType,
+                                  k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #endif
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error. status = %d\n", status);
-            throw("cublas error");
-            exit(0);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error. status = %d\n", status);
+                throw("cublas error");
+                exit(0);
+            }
         }
 
         len = n * k;
@@ -325,7 +621,6 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
             FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
         }
         FastllmCudaFree(cudaFp16Input);
-        FastllmCudaFree(cudaFp16Weight);
 #else
         FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
@@ -335,8 +630,8 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
-        FastllmCudaFree(cudaFp16Weight);
 #endif
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else {
         LaunchFastllmGemmFp32Int4Group(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaMins, n, m, k, group, groupCnt);
     }
@@ -345,7 +640,111 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
     return true;
 }
 
+// 优化版本: 每个 warp 负责一行输出, 每个 lane 一次加载 8 个 INT4 权重字节 (uint2 = 16 个 nibble),
+// 使用 warp shuffle 归约, 去除 shared memory 与 __syncthreads, 显著提升访存带宽利用率。
+// 参照 FP8 的 FastllmGemvHalfFP8E4M3KernelWarpMultiRow。
+// 要求 m % 16 == 0 且 groupCnt % 16 == 0 (AWQ groupCnt 32/64/128 均满足),
+// 这样每 16 个元素的对齐单元必定落在同一量化组内, scale/min 取一次即可。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvHalfInt4GroupKernelWarpMultiRow(
+        const half * __restrict__ A, const uint8_t * __restrict__ B,
+        half * __restrict__ C, const half * __restrict__ bias,
+        const half * __restrict__ scales, const half * __restrict__ mins,
+        int m, int k, int group, int groupCnt) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const uint8_t *baseB = B + (size_t)st * (m / 2);
+    const half *rowScales = scales + (size_t)st * group;
+    const half *rowMins = mins + (size_t)st * group;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    const int numUnits = m >> 4;  // 每单元 16 个元素 (8 字节权重)
+    for (int u = laneId; u < numUnits; u += 32) {
+        const int i = u << 4;
+        const int g = i / groupCnt;
+        const float curScale = __half2float(__ldg(rowScales + g));
+        const float curMin = __half2float(__ldg(rowMins + g));
+
+        union_char8 bw;
+        bw.in = *reinterpret_cast<const uint2 *>(baseB + (size_t)u * 8);
+        // 解出 16 个权重值: 字节 b 的高 nibble = 元素 2b, 低 nibble = 元素 2b+1
+        float wval[16];
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const uint8_t byteVal = bw.out[b];
+            wval[b * 2]     = curMin + curScale * (float)(byteVal >> 4);
+            wval[b * 2 + 1] = curMin + curScale * (float)(byteVal & 15);
+        }
+
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            const half *Ax = A + (size_t)x * m + i;
+            union_half8 a0, a1;
+            a0.in = *reinterpret_cast<const uint4 *>(Ax);
+            a1.in = *reinterpret_cast<const uint4 *>(Ax + 8);
+            float gsum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; j++) gsum += (float)a0.out[j] * wval[j];
+#pragma unroll
+            for (int j = 0; j < 8; j++) gsum += (float)a1.out[j] * wval[8 + j];
+            acc[x] += gsum;
+        }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float r = acc[x];
+            if (bias != nullptr) r += (float)bias[st];
+            C[st + (size_t)k * x] = (half)r;
+        }
+    }
+}
+
 void LaunchFastllmGemmFp16Int4Group(half *input, uint8_t *weight, half *output, half *bias, half *scales, half *mins, int n, int m, int k, int group, int groupCnt) {
+    // 满足 16 对齐时走 warp 优化版 GEMV (参照 FP8 warp kernel)。
+    if ((m & 15) == 0 && groupCnt > 0 && (groupCnt & 15) == 0) {
+        constexpr int W = 8;  // 每个 block 8 个 warp (256 线程)
+        const int grid = (k + W - 1) / W;
+#define FASTLLM_INT4G_WARP_LAUNCH(PARTVAL, OFF) \
+        FastllmGemvHalfInt4GroupKernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+            input + (OFF) * m, weight, output + (OFF) * k, bias, scales, mins, m, k, group, groupCnt)
+        switch (n) {
+            case 1:  FASTLLM_INT4G_WARP_LAUNCH(1, 0);  return;
+            case 2:  FASTLLM_INT4G_WARP_LAUNCH(2, 0);  return;
+            case 3:  FASTLLM_INT4G_WARP_LAUNCH(3, 0);  return;
+            case 4:  FASTLLM_INT4G_WARP_LAUNCH(4, 0);  return;
+            case 5:  FASTLLM_INT4G_WARP_LAUNCH(5, 0);  return;
+            case 6:  FASTLLM_INT4G_WARP_LAUNCH(6, 0);  return;
+            case 7:  FASTLLM_INT4G_WARP_LAUNCH(7, 0);  return;
+            case 8:  FASTLLM_INT4G_WARP_LAUNCH(8, 0);  return;
+            default: break;
+        }
+        int i = 0;
+        for (; i + 7 < n; i += 8) FASTLLM_INT4G_WARP_LAUNCH(8, i);
+        for (; i + 3 < n; i += 4) FASTLLM_INT4G_WARP_LAUNCH(4, i);
+        for (; i + 1 < n; i += 2) FASTLLM_INT4G_WARP_LAUNCH(2, i);
+        for (; i < n; i++)        FASTLLM_INT4G_WARP_LAUNCH(1, i);
+#undef FASTLLM_INT4G_WARP_LAUNCH
+        return;
+    }
+
     if (n == 1) {
         FastllmGemvHalfInt4GroupKernelMultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
     } else if (n == 2) {
@@ -387,12 +786,166 @@ void LaunchFastllmGemmFp16Int4Group(half *input, uint8_t *weight, half *output, 
     
 }
 
-static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
-    if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
-        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[0]);
-        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[1]);
+__global__ void FastllmCudaInt4GroupToMarlinQWeightKernel(const uint8_t *weight, uint32_t *qweight, int m, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int packsPerRow = m / 8;
+    int total = packsPerRow * k;
+    if (idx >= total) {
+        return;
+    }
 
+    int pack = idx / k;
+    int out = idx - pack * k;
+    int xBase = pack * 8;
+    const uint8_t *row = weight + (size_t)out * m / 2;
+
+    uint32_t v = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint8_t packed = row[(xBase + i) >> 1];
+        uint32_t q = ((xBase + i) & 1) ? (packed & 15) : (packed >> 4);
+        v |= q << (i * 4);
+    }
+    qweight[idx] = v;
+}
+
+static bool FastllmCudaInt4GroupMarlinEnabled(int n, int m, int k, int groupCnt) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    int dev = 0;
+    int major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        major * 10 + minor < 75) {
+        return false;
+    }
+    return n >= 1 && groupCnt == 128 && m % groupCnt == 0 &&
+           groupCnt % 16 == 0 && m % 64 == 0 && k % 64 == 0;
+#endif
+}
+
+static void FastllmBuildMarlinPermutedScalesAndZeros(const fastllm::Data &weight,
+                                                      std::vector<half> &scales,
+                                                      std::vector<uint32_t> &zeros,
+                                                      int m, int k) {
+    int group = weight.group;
+    scales.resize((size_t)group * k);
+    std::vector<uint8_t> zeroValues((size_t)group * k);
+
+    const int scalePerm[64] = {
+        0, 8, 16, 24, 32, 40, 48, 56,
+        1, 9, 17, 25, 33, 41, 49, 57,
+        2, 10, 18, 26, 34, 42, 50, 58,
+        3, 11, 19, 27, 35, 43, 51, 59,
+        4, 12, 20, 28, 36, 44, 52, 60,
+        5, 13, 21, 29, 37, 45, 53, 61,
+        6, 14, 22, 30, 38, 46, 54, 62,
+        7, 15, 23, 31, 39, 47, 55, 63
+    };
+    const int zpInterleave[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+    std::vector<float> scaleGN((size_t)group * k);
+    std::vector<uint8_t> zeroGN((size_t)group * k);
+    for (int g = 0; g < group; g++) {
+        for (int out = 0; out < k; out++) {
+            size_t dst = (size_t)g * k + out;
+            size_t src = (size_t)out * group + g;
+            float s = weight.scales[src];
+            float minv = weight.mins[src];
+            int z = s == 0.0f ? 0 : (int)std::lroundf(-minv / s);
+            z = std::max(0, std::min(15, z));
+            scaleGN[dst] = s;
+            zeroGN[dst] = (uint8_t)z;
+        }
+    }
+
+    for (size_t base = 0; base < scaleGN.size(); base += 64) {
+#pragma unroll
+        for (int i = 0; i < 64; i++) {
+            scales[base + i] = (half)scaleGN[base + scalePerm[i]];
+            zeroValues[base + i] = zeroGN[base + scalePerm[i]];
+        }
+    }
+
+    for (size_t base = 0; base < zeroValues.size(); base += 8) {
+        uint8_t tmp[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            tmp[i] = zeroValues[base + zpInterleave[i]];
+        }
+        uint32_t packed = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            packed |= ((uint32_t)tmp[i]) << (i * 4);
+        }
+        zeros.push_back(packed);
+    }
+}
+
+static bool FastllmCudaInt4GroupEnsureMarlinOnDevice(fastllm::Data &weight, int m, int k) {
+    if (FastllmCudaInt4GroupHasMarlinOnDevice(weight)) {
+        return true;
+    }
+
+    if (weight.group <= 0 || weight.groupCnt <= 0 ||
+        weight.scales.size() != (size_t)k * weight.group ||
+        weight.mins.size() != (size_t)k * weight.group ||
+        weight.cudaData == nullptr) {
+        return false;
+    }
+
+    size_t qweightCount = (size_t)(m / 8) * k;
+    uint32_t *stdQWeight = (uint32_t*)FastllmCudaMalloc(qweightCount * sizeof(uint32_t));
+    uint32_t *marlinQWeight = (uint32_t*)FastllmCudaMalloc(qweightCount * sizeof(uint32_t));
+
+    int threads = 256;
+    int blocks = (int)((qweightCount + threads - 1) / threads);
+    FastllmCudaInt4GroupToMarlinQWeightKernel <<< blocks, threads >>>(
+        (const uint8_t*)weight.cudaData, stdQWeight, m, k);
+
+    bool repacked = FastllmCudaGptqMarlinRepack(stdQWeight, marlinQWeight, m, k);
+    FastllmCudaFree(stdQWeight);
+    if (!repacked) {
+        FastllmCudaFree(marlinQWeight);
+        return false;
+    }
+    FastllmCudaInt4GroupReleaseOriginalWeight(weight);
+
+    std::vector<half> hostScales;
+    std::vector<uint32_t> hostZeros;
+    hostZeros.reserve((size_t)weight.group * k / 8);
+    FastllmBuildMarlinPermutedScalesAndZeros(weight, hostScales, hostZeros, m, k);
+
+    half *marlinScales = (half*)FastllmCudaMalloc(hostScales.size() * sizeof(half));
+    uint32_t *marlinZeros = (uint32_t*)FastllmCudaMalloc(hostZeros.size() * sizeof(uint32_t));
+    FastllmCudaCopyFromHostToDevice(marlinScales, hostScales.data(), hostScales.size() * sizeof(half));
+    FastllmCudaCopyFromHostToDevice(marlinZeros, hostZeros.data(), hostZeros.size() * sizeof(uint32_t));
+
+    int workspaceInts = std::max(1, (k / 64) * 16);
+    int *workspace = (int*)FastllmCudaMalloc((size_t)workspaceInts * sizeof(int));
+    FastllmCudaMemset0(workspace, (size_t)workspaceInts * sizeof(int));
+
+    if ((int)weight.extraCudaData.size() <= INT4GROUP_MARLIN_WORKSPACE_IDX) {
+        weight.extraCudaData.resize(INT4GROUP_MARLIN_WORKSPACE_IDX + 1, nullptr);
+    }
+    weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX] = (void*)marlinQWeight;
+    weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX] = (void*)marlinZeros;
+    weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX] = (void*)workspace;
+
+    if ((int)weight.extraCudaHalfData.size() <= INT4GROUP_MARLIN_SCALES_HALF_IDX) {
+        weight.extraCudaHalfData.resize(INT4GROUP_MARLIN_SCALES_HALF_IDX + 1, nullptr);
+    }
+    weight.extraCudaHalfData[INT4GROUP_MARLIN_SCALES_HALF_IDX] = (void*)marlinScales;
+    return true;
+}
+
+static half *FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    if ((int)weight.extraCudaHalfData.size() <= INT4GROUP_HALF_BIAS_IDX) {
+        weight.extraCudaHalfData.resize(INT4GROUP_HALF_BIAS_IDX + 1, nullptr);
+    }
+    if (weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX] == nullptr) {
         half *cudaBiasData;
         cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(half));
         if (bias.dims.size() > 0) {
@@ -406,82 +959,147 @@ static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, co
             state = cudaMemset(cudaBiasData, 0, k * sizeof(half));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaHalfData.push_back((void*)cudaBiasData);
+        weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX] = (void*)cudaBiasData;
     }
+    return (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
+}
+
+static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
+    if ((int)weight.extraCudaHalfData.size() <= INT4GROUP_HALF_BIAS_IDX) {
+        weight.extraCudaHalfData.resize(INT4GROUP_HALF_BIAS_IDX + 1, nullptr);
+    }
+    if (weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX] == nullptr) {
+        weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX] =
+            weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX];
+    }
+    if (weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX] == nullptr) {
+        weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX] =
+            weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX];
+    }
+    FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(weight, bias, k);
 }
 
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     int group = weight.group, groupCnt = weight.groupCnt;
-    FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
-    FastllmCudaInt4GroupEnsureHalfBiasOnDevice(weight, bias, k);
-
-    half *cudaScales = (half*)weight.extraCudaHalfData[0];
-    half *cudaMins = (half*)weight.extraCudaHalfData[1];
+    bool useMarlin = FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
+                     FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
+    bool useSm70Awq = !useMarlin &&
+                      FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
+                      FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
+    if (!useMarlin && !useSm70Awq) {
+        if (weight.cudaData == nullptr) {
+            FastllmCudaInt4GroupFallbackUnavailable();
+        }
+        FastllmCudaInt4GroupEnsureHalfBiasOnDevice(weight, bias, k);
+    }
 
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
-    if (n > 16) {
+    if (useSm70Awq) {
+        bool ok = fastllm::awq_sm70::Gemm(g_sm70AwqHandles[&weight], cudaInput, cudaOutput, n, 0);
+        if (!ok) {
+            printf("Error: INT4_GROUP SM70 AWQ GEMM failed.\n");
+            throw("int4group sm70 awq gemm error");
+        }
+        if (bias.dims.size() > 0) {
+            half *cudaBiasData = FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(weight, bias, k);
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        }
+    } else if (useMarlin) {
+        uint32_t *marlinQWeight = (uint32_t*)weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX];
+        uint32_t *marlinZeros = (uint32_t*)weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX];
+        int *marlinWorkspace = (int*)weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX];
+        half *marlinScales = (half*)weight.extraCudaHalfData[INT4GROUP_MARLIN_SCALES_HALF_IDX];
+
+        bool marlinOk = FastllmCudaMarlinHalfInt4Gemm(cudaInput, marlinQWeight, marlinScales, marlinZeros,
+                                                      cudaOutput, n, k, m, groupCnt, marlinWorkspace);
+        if (!marlinOk) {
+            printf("Error: INT4_GROUP Marlin GEMM failed after original CUDA weight was released.\n");
+            throw("int4group marlin gemm error");
+            exit(0);
+        }
+        if (bias.dims.size() > 0) {
+            half *cudaBiasData = FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(weight, bias, k);
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        }
+    } else if (n > 16) {
+        half *cudaScales = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX];
+        half *cudaMins = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX];
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        half *cudaFp16Weight;
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        // 借用 FlashInfer 的 d_float_workspace 作为 INT4 -> FP16 的反量化临时缓冲；
+        // 两次 attention 之间该 workspace 内容是无效的（attention 入口会重新 plan 覆盖）。
+        // 如果一次 dequant 不下整张 weight (k*m*2B)，按 K 维分块多次执行。
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
+        size_t bytesPerRow = (size_t)m * sizeof(half);
+        int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
 #ifdef CUDA_NO_TENSOR_CORE
-        float *cudaFp32Output = (float *) FastllmCudaMalloc(n * k * sizeof(float));
+        float *cudaFp32Output = (float *) FastllmCudaMalloc((size_t)n * k * sizeof(float));
         float h_alpha = 1.0, h_beta = 0.0;
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
 #else
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
 #endif
-        cublasStatus_t status;
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
-        int len = n * m;
-        int threadPerBlock = std::min(256, len);
+        for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+            int kc = std::min(maxRowsPerChunk, k - kOff);
 
-        len = k * m;
-
-        FastllmCudaInt4Group2HalfKernel <<< k, 256 >>>((uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaFp16Weight, k, m, group, groupCnt);
+            FastllmCudaInt4Group2HalfKernel <<< kc, 256 >>>(
+                (uint8_t*)weight.cudaData + (size_t)kOff * m / 2,
+                cudaScales + (size_t)kOff * group,
+                cudaMins + (size_t)kOff * group,
+                cudaFp16Weight, kc, m, group, groupCnt);
 
 #ifdef CUDA_NO_TENSOR_CORE
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaInput, BType,
-                                m, &h_beta,
-                                cudaFp32Output, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            // 子矩阵写入 cudaFp32Output 的 [kOff:kOff+kc, :] 行段，ldc 仍为 k
+            status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    kc, n, m,
+                                    &h_alpha, cudaFp16Weight, AType,
+                                    m, cudaInput, BType,
+                                    m, &h_beta,
+                                    cudaFp32Output + kOff, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaInput, BType,
-                                m, &h_beta,
-                                cudaOutput, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-
+            status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    kc, n, m,
+                                    &h_alpha, cudaFp16Weight, AType,
+                                    m, cudaInput, BType,
+                                    m, &h_beta,
+                                    cudaOutput + kOff, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #endif
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error. status = %d\n", status);
-            throw("cublas error");
-            exit(0);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error. status = %d\n", status);
+                throw("cublas error");
+                exit(0);
+            }
         }
 
 #ifdef CUDA_NO_TENSOR_CORE
-        len = n * k;
+        int len = n * k;
+        int threadPerBlock = std::min(256, len);
         FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp32Output, cudaOutput, len);
         FastllmCudaFree(cudaFp32Output);
 #endif
         if (bias.dims.size() > 0) {
-            half *cudaBiasData = (half*)weight.extraCudaHalfData[2];
+            half *cudaBiasData = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
 
-        FastllmCudaFree(cudaFp16Weight);
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else {
-        half *cudaBiasData = (half*)weight.extraCudaHalfData[2];
+        half *cudaScales = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX];
+        half *cudaMins = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX];
+        half *cudaBiasData = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
         LaunchFastllmGemmFp16Int4Group(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaMins, n, m, k, group, groupCnt);
     }
     FastllmCudaFinishInput(input, cudaInput);
@@ -793,43 +1411,59 @@ bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm:
 
     if (n > 16) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        half *cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
+        size_t bytesPerRow = (size_t)m * sizeof(half);
+        int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+
+        // INT4_GROUP128 的物理 layout：每行字节数 = (m/128) * 72
+        const int kGroupCnt = 128;
+        const int kGroupStride = kGroupCnt / 2 + (int)sizeof(float) * 2;
+        const int kRowBytes = (m / kGroupCnt) * kGroupStride;
 
 #ifdef CUDA_NO_TENSOR_CORE
-        float *cudaFp32Output = (float *) FastllmCudaMalloc(n * k * sizeof(float));
+        float *cudaFp32Output = (float *) FastllmCudaMalloc((size_t)n * k * sizeof(float));
         float h_alpha = 1.0, h_beta = 0.0;
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
 #else
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
 #endif
-        cublasStatus_t status;
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
-        FastllmCudaInt4Group1282HalfKernel <<< k, 256 >>>((uint8_t*)weight.cudaData, cudaFp16Weight, k, m, halfBlock);
+        for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+            int kc = std::min(maxRowsPerChunk, k - kOff);
+
+            FastllmCudaInt4Group1282HalfKernel <<< kc, 256 >>>(
+                (uint8_t*)weight.cudaData + (size_t)kOff * kRowBytes,
+                cudaFp16Weight, kc, m, halfBlock);
 
 #ifdef CUDA_NO_TENSOR_CORE
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaInput, BType,
-                                m, &h_beta,
-                                cudaFp32Output, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    kc, n, m,
+                                    &h_alpha, cudaFp16Weight, AType,
+                                    m, cudaInput, BType,
+                                    m, &h_beta,
+                                    cudaFp32Output + kOff, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaInput, BType,
-                                m, &h_beta,
-                                cudaOutput, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    kc, n, m,
+                                    &h_alpha, cudaFp16Weight, AType,
+                                    m, cudaInput, BType,
+                                    m, &h_beta,
+                                    cudaOutput + kOff, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #endif
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error. status = %d\n", status);
-            throw("cublas error");
-            exit(0);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error. status = %d\n", status);
+                throw("cublas error");
+                exit(0);
+            }
         }
 
 #ifdef CUDA_NO_TENSOR_CORE
@@ -842,7 +1476,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm:
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
 
-        FastllmCudaFree(cudaFp16Weight);
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else {
         LaunchFastllmGemmFp16Int4Group128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k, halfBlock);
     }

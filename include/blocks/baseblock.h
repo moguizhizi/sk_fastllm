@@ -104,7 +104,11 @@ namespace fastllm {
         bool isPrefill,
         Data *hiddenStates,
         bool doQKNorm,
-        bool doPostQKNorm
+        bool doPostQKNorm,
+        int pagedCacheLayerOffset = 0,
+        bool skipOutputProjection = false,
+        bool externalDecodeMeta = false,
+        bool attentionPagedBatchSync = true
     );
     /*
     MergeMOE with optional activation type conversion:

@@ -203,16 +203,27 @@ class ToolParserManager:
     
     @classmethod
     def get_tool_parser_auto(cls, model_type, chat_template, force_chat_template = False, force_type = "auto") -> type:
+        chat_template = chat_template or ""
+        def is_qwen_xml_tool_template(template: str) -> bool:
+            return (
+                "<function=" in template or
+                "<parameter=" in template or
+                "qwen3_coder" in template
+            )
         if (force_type not in ['auto', '']):
             # 如果指定了tool_parser类型，那么直接使用
             return cls.get_tool_parser(force_type)
         if (force_chat_template):
             # 如果指定了强制指定了chat_template，那么尝试检测tool调用类型
             target = ""
-            if ("<｜tool▁calls▁begin｜>" in chat_template):
+            if ("<｜DSML｜tool_calls>" in chat_template):
+                target = "deepseek_v4"
+            elif ("<｜tool▁calls▁begin｜>" in chat_template):
                 target = "deepseek_v31"
             elif ("<minimax:tool_call>" in chat_template):
                 target = "minimax_m2"
+            elif is_qwen_xml_tool_template(chat_template):
+                target = "qwen3_coder"
             if (target == ""):
                 print("Warning: can't detect tool parse, use default tool parser")
                 target = "hermes"
@@ -221,9 +232,11 @@ class ToolParserManager:
             return cls.get_tool_parser(target)
 
         if (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
-            or model_type == "qwen3_next"):
+            or model_type == "qwen3_next" or model_type == "qwen3_5"
+            or model_type == "qwen3_5_text" or model_type == "qwen3_5_moe"
+            or model_type == "qwen3_5_moe_text"):
             # 判断是否是coder系列模型（使用xml工具调用）
-            if ('<function>' in chat_template):
+            if is_qwen_xml_tool_template(chat_template):
                 target = 'qwen3_coder'
             else:
                 target = 'hermes'
@@ -233,6 +246,8 @@ class ToolParserManager:
             target = 'minimax_m2'
         elif model_type == 'kimi_k2':
             target = 'kimi_k2'
+        elif model_type == 'deepseek_v4':
+            target = 'deepseek_v4'
         elif model_type == 'deepseek_v3' or model_type == 'deepseek_v2':
             target = 'deepseek_v31'
         else:

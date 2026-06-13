@@ -6,18 +6,46 @@
 #define FASTLLM_QWEN3_5_H
 #include "basellm.h"
 #include "cmath"
+#include "utils/persistent_worker_group.h"
 
+#include <array>
+#include <atomic>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <set>
+#include <unordered_map>
 #include <vector>
 
 namespace fastllm {
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
+        virtual ~Qwen3_5Model();
 
         virtual void InitParams(); // 初始化参数信息
 
         virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) override;
+
+        virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) override;
+
+        virtual int GetWeightLoadPriority(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const override;
+
+        virtual bool ShouldLoadWeightSeriallyBeforeOthers(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const override;
+
+        virtual void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+
+        virtual bool IsWeightConsumedAfterLoad(const std::string &weightName) const override;
+
+        virtual void OnWeightLoadGroupFinished() override;
+
+        virtual void OnModelWeightsLoaded() override;
+
+        virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const override;
         
         // 推理
         virtual int Forward(
@@ -39,11 +67,53 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::vector <int> ForwardGPU(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr) override;
+
+        virtual std::vector <int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr) override;
         
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
 
         virtual void WarmUp(); // 预热
+
+        virtual void OnAutoWarmupFinished() override;
+
+        virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
+        virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
+        virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
+        virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
+        virtual int GetChunkedPrefillSize() override;
+
+        virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
+
+        virtual void WarmupCudaRuntimeBuffers(int batch) override;
+
+        virtual void OnResponseContextCreated(ResponseContext *context) override;
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) override;
+
+        virtual bool UseModelSpecificScheduler() const override;
+
+        virtual void RunModelSpecificScheduler() override;
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
@@ -55,6 +125,59 @@ namespace fastllm {
         static const std::string visual_prefix;
 
     protected:
+        bool IsThreadTensorParallelEnabled() const;
+
+        std::vector <int> ForwardV2ThreadTensorParallel(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        void ForwardSingleGPU(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits,
+                Data *precomputedHiddenStates = nullptr);
+
+        bool ForwardSingleGPUDecodeGraph(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits,
+                Data *precomputedHiddenStates = nullptr);
+
+        void PreCaptureCudaGraphAfterWarmup();
+        void PreAllocateLinearSlotPoolsForCudaGraph(
+                const std::vector<int> &devices,
+                const std::map<int, int> &ratios,
+                int slotCapacity);
+
+        Data &GetThreadTensorParallelBias(const std::string &name);
+
         RoPEType rope_type = RoPEType::BASE;
 
         float rope_base = 10000.f;
@@ -71,17 +194,165 @@ namespace fastllm {
         bool initialized_add1 = false;
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
+        int mtp_num_hidden_layers = 0;
+        struct MtpKvCache {
+            Data key;
+            Data value;
+            int tokens = 0;
+        };
+        bool mtpWeightsPrepared = false;
+        int mtpWeightsPreparedDevice = -1;
+        bool speculativeCollectAllLogits = false;
+        bool speculativeCacheOnlyForward = false;
+        Data speculativeHiddenStates;
+        bool speculativeCaptureFirstTokenLinearState = false;
+        int speculativeLinearStateCaptureSlots = 0;
+        std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
+        std::vector<std::vector<int> > speculativeLinearCaptureMask;
+        std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
+        std::vector<int> speculativeFirstTokenLinearCaptureMask;
+        std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
+        std::mutex mtpCacheMutex;
+        std::atomic<bool> mtpLogPrinted{false};
+        std::atomic<bool> mtpSkipLogPrinted{false};
+        std::atomic<long long> mtpValidationCount{0};
+        std::array<std::atomic<long long>, 8> mtpDraftPositionAttempts{};
+        std::array<std::atomic<long long>, 8> mtpDraftPositionAccepts{};
 
         Data inv_scale_data;
 
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
+        bool loadFusedMoePlanned = false;
+        bool moeFusedWeightsPrepared = false;
+        std::vector <char> moeFusedLayerPlanned;
+        std::set <std::string> loadFusedMoeSourceWeights;
+        std::set <std::string> consumedFusedMoeSourceWeights;
+        std::vector <Data*> moeGate3DWeights;
+        std::vector <Data*> moeUp3DWeights;
+        std::vector <Data*> moeDown3DWeights;
+        std::vector <std::vector <char> > moeGate3DExpertReady;
+        std::vector <std::vector <char> > moeUp3DExpertReady;
+        std::vector <std::vector <char> > moeDown3DExpertReady;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
         bool moeWeightsPrepared = false;
         bool gdnMergedWeightsPrepared = false;
+        std::vector <int> mrope_sections = {11, 11, 10};
+        bool visionPrepared = false;
+        int vision_depth = 0;
+        int vision_hidden_size = 0;
+        int vision_num_heads = 0;
+        int vision_head_dim = 0;
+        int vision_intermediate_size = 0;
+        int vision_patch_size = 16;
+        int vision_temporal_patch_size = 2;
+        int vision_spatial_merge_size = 2;
+        int vision_out_hidden_size = 0;
+        int vision_num_position_embeddings = 0;
+        int vision_num_grid_per_side = 0;
+        int image_token_id = -1;
+        int video_token_id = -1;
+        int vision_start_token_id = -1;
+        int vision_end_token_id = -1;
+        std::vector<int> vision_deepstack_visual_indexes;
+        std::vector<float> vision_image_mean = {0.5f, 0.5f, 0.5f};
+        std::vector<float> vision_image_std = {0.5f, 0.5f, 0.5f};
+        Data visionSinData;
+        Data visionCosData;
+
+        std::unordered_map <std::string, Data> threadTpEmptyBiases;
+        int threadTpPagedCacheBase = -1;
+        std::mutex threadTpWeightPrepareLock;
+        std::atomic<bool> singleGpuWeightsPrepared{false};
+        std::atomic<bool> threadTpWeightsPrepared{false};
+        std::atomic<bool> cudaGraphPreCaptureRunning{false};
+        std::vector <int> threadTpPreparedDevices;
+        std::map <int, int> threadTpPreparedRatios;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpAttentionKVHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
+        std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        PersistentWorkerGroup threadTpWorkerGroup;
 
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
+        bool TryConsumeFusedMoeSourceWeight(const std::string &weightName);
+        void TryFinalizeFusedMoeLayerParts(int layer);
+        bool TryBuildFusedMoeWeightsFromLoaded();
+        bool TryBuildFusedMoeLayerFromLoaded(int layer);
+        bool IsFusedMoeLayerPlanned(int layer) const;
+        bool HasPlannedFusedMoeLayers() const;
+        bool ArePlannedFusedMoeLayersReady() const;
+        bool HasFusedMoeWeights(int layer) const;
+        Data *GetFusedMoeWeightForDevice(Data *weight, int device) const;
+        void PrepareFusedMoeLayerForDevices(int layer, const std::vector <int> &devices,
+                                             std::map <int, int> ratios);
+        void PrepareFusedMoeWeightsForDevices(const std::vector <int> &devices,
+                                              std::map <int, int> ratios);
         void PrepareGdnWeights();
+        void PrepareVision();
+        Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
+                                      const std::vector <int> &seqLens,
+                                      bool all1);
+        void MergeMultimodalFeaturesIntoText(const Data &mmTokenTypeIds,
+                                             const Data *imageEmbeds,
+                                             const Data *videoEmbeds,
+                                             Data &hiddenStates);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void EncodeVisualItems(const std::vector <Data*> &rawInputs,
+                               const Data *gridThwData,
+                               bool isVideo,
+                               Data &features,
+                               std::vector<std::vector<int>> &gridThwList);
+        void BuildMultimodalPositionData(const Data &inputIds,
+                                         const std::vector<std::vector<int>> &imageGridThwList,
+                                         const std::vector<std::vector<int>> &videoGridThwList,
+                                         Data &mmTokenTypeIds,
+                                         Data &mropePositionIds,
+                                         Data &mropePositionDelta);
+        void ApplyMultimodalRotary(Data &input, const Data &positionIds, float ropeScale);
+        void AdjustPositionIdsWithDelta(const Data &positionIds,
+                                        const Data &mropePositionDelta,
+                                        Data &adjustedPositionIds);
+        bool HasMtpWeights() const;
+        void AddMtpRmsNormOffset();
+        void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
+        Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
+        int RunMtpGreedyDraft(int device, const std::vector<int> &devices,
+                              MtpKvCache &cache,
+                              const Data &targetHiddenStates,
+                              const std::vector<int> &inputTokens,
+                              const Data &positionIds, int sampleRow,
+                              Data *sampledHiddenStates = nullptr);
+        void Qwen35MTPLoop();
+        bool Qwen35MTPForward(
+                bool useGPUForward,
+                ResponseContext *context,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens);
+        std::vector <int> ForwardFromHiddenStates(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const Data &allPositionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits,
+                Data &hiddenStates,
+                bool all1);
     };
 }
 

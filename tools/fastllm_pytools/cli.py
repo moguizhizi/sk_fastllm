@@ -29,7 +29,7 @@ def save_defaults_to_json(parser, filename):
             defaults[name] = False  # store_true参数的默认值是False
         else:
             defaults[name] = action.default
-    defaults["FASTLLM_USE_NUMA"] = "OFF"
+    defaults["FASTLLM_ACTIVATE_NUMA"] = "OFF"
     defaults["FASTLLM_NUMA_THREADS"] = 27
 
     # 将字典转换为JSON并保存到文件
@@ -50,14 +50,22 @@ def args_parser():
     from ftllm.download import make_download_parser
     download_parser = make_download_parser(add_help = False)
 
-    # 打开ui界面
-    ui_parser_ = subparsers.add_parser('ui', parents = [shared_parser], help = 'ui模式')
+    # 打开终端部署向导
+    tui_parser_ = subparsers.add_parser('tui', help = '终端部署向导')
+    tui_parser_.add_argument('--plain', action = 'store_true', help = '使用普通问答模式，不启用curses界面')
 
     # 创建chat子命令（使用共享解析器）
     chat_parser_ = subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
 
     # 创建run子命令（使用相同的共享解析器）
     run_parser_ = subparsers.add_parser('run', parents = [shared_parser], help = '运行模式')
+
+    # 创建benchmark子命令（使用相同的共享解析器）
+    from ftllm.benchmark import add_benchmark_args
+    benchmark_parser_ = subparsers.add_parser('benchmark', aliases = ['bench'],
+                                              parents = [shared_parser],
+                                              help = '性能测试模式')
+    add_benchmark_args(benchmark_parser_)
 
     download_parser_ = subparsers.add_parser('download', parents = [download_parser], help = '下载模型')
 
@@ -90,10 +98,13 @@ def main():
         print("ftllm version: " + __version__)
         return
     # 根据不同的子命令执行不同的操作
-    if args.command == 'ui':
-        from .ui import FastllmStartUI
-        FastllmStartUI()
-    if args.command == 'config':
+    if args.command is None:
+        from .tui import FastllmTUI
+        raise SystemExit(FastllmTUI())
+    elif args.command == 'tui':
+        from .tui import FastllmTUI
+        raise SystemExit(FastllmTUI(plain = args.plain))
+    elif args.command == 'config':
         file = args.file
         if not(file) or file == '':
             file = "config.json"
@@ -107,6 +118,9 @@ def main():
     elif args.command in ('chat', 'run'):
         from ftllm.chat import fastllm_chat
         fastllm_chat(args)
+    elif args.command in ('benchmark', 'bench'):
+        from ftllm.benchmark import fastllm_benchmark
+        fastllm_benchmark(args)
     elif args.command == "download":
         from ftllm.download import HFDDownloader
         HFDDownloader(args).run()

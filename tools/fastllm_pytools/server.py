@@ -15,6 +15,7 @@ from .openai_server.fastllm_reranker import FastLLmReranker
 from .openai_server.fastllm_model import FastLLmModel
 from .util import make_normal_parser
 from .util import add_server_args
+from .util import apply_page_size_default
 global fastllm_completion
 global fastllm_embed
 global fastllm_reranker
@@ -55,7 +56,7 @@ def set_ulimit(target_soft_limit: int = 65535):
 def parse_args():
     parser = make_normal_parser("OpenAI-compatible API server")
     add_server_args(parser)
-    return parser.parse_args()
+    return apply_page_size_default(parser.parse_args())
 
 app = fastapi.FastAPI()
 # 设置允许的请求来源, 生产环境请做对应变更
@@ -71,6 +72,13 @@ fastllm_completion:FastLLmCompletion
 fastllm_embed:FastLLmEmbed
 fastllm_model:FastLLmModel
 dev_mode_enabled:bool = False
+
+class FastLLMUvicornServer(uvicorn.Server):
+    async def startup(self, sockets = None):
+        await super().startup(sockets)
+        if self.started and not self.should_exit:
+            from .llm import disable_cuda_malloc
+            disable_cuda_malloc()
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
@@ -221,6 +229,7 @@ def fastllm_server(args):
     if dev_mode_enabled:
         logging.info("Development mode enabled - conversation management APIs are active")
     
+    apply_page_size_default(args)
     init_logging()
     logging.info(args)
     from .util import make_normal_llm_model
@@ -231,12 +240,16 @@ def fastllm_server(args):
         args.model_name = args.path
         if (args.model_name is None or args.model_name == ''):
             args.model_name = args.model
-    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model, think = (args.think.lower() != "false"), hide_input = args.hide_input)
+    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model,
+                                           think = (args.think.lower() != "false"),
+                                           enable_thinking = getattr(model, "enable_thinking", True),
+                                           hide_input = args.hide_input)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name)
     set_ulimit()
-    uvicorn.run(app, host = args.host, port = args.port)
+    config = uvicorn.Config(app, host = args.host, port = args.port)
+    FastLLMUvicornServer(config).run()
 
 if __name__ == "__main__":
     args = parse_args()

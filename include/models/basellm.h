@@ -6,6 +6,7 @@
 #include "baseblock.h"
 #include "template.h"
 
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -53,7 +54,7 @@ namespace fastllm {
 
         void Init(int blocks, DataType dataType, DataType kvCacheDataType);
         void TryRecord(basellm *model);
-        void TryRecordPagedCache();
+        void TryRecordPagedCache(basellm *model);
     };
 
     struct ResponseContextDict {
@@ -169,7 +170,7 @@ namespace fastllm {
     public:
         basellm() {};
 
-        ~basellm();
+        virtual ~basellm();
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
@@ -179,8 +180,39 @@ namespace fastllm {
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
                 GetTensorMap(const std::vector <std::string> &tensorNames);
 
+        // 所有权重占位创建完成、实际读入前，允许模型提前规划加载策略。
+        virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) {}
+
+        // 返回值越小越先读，供模型把需要二次合成的权重提前读入。
+        virtual int GetWeightLoadPriority(const std::string &tensorName,
+                                          const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+            return 0;
+        }
+
+        // 返回 true 时，loader 会在普通并行加载前先读取该 tensor，便于流式合成后立即释放源权重。
+        virtual bool ShouldLoadWeightSeriallyBeforeOthers(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+            return false;
+        }
+
+        // 一组提前读取的权重即将开始读取，模型可预分配目标权重空间。
+        virtual void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) {}
+
         // 某个权重完成加载后，允许模型做额外处理（如拆分 fused MoE 权重）
         virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) {}
+
+        // 权重加载回调是否已经消费该源权重；若已消费，loader 会跳过后续 merge / cuda 移动。
+        virtual bool IsWeightConsumedAfterLoad(const std::string &weightName) const { return false; }
+
+        // 一组提前读取的权重读取结束，模型可统一删除已消费的源权重占位。
+        virtual void OnWeightLoadGroupFinished() {}
+
+        // 所有权重完成加载后，允许模型做收尾合成。
+        virtual void OnModelWeightsLoaded() {}
+
+        // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
+        virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
         // 推理
         virtual int Forward(
@@ -214,6 +246,17 @@ namespace fastllm {
                 std::vector <std::vector <float>*> *logits = nullptr);
 
         virtual std::vector <int> ForwardV2(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::vector <int> ForwardGPU(
                 int batch,
                 const Data &inputIds,
                 const std::vector <Data*> &attentionMask,
@@ -276,9 +319,34 @@ namespace fastllm {
 
         virtual void WarmUp() {}; // 预热
 
+        virtual void OnAutoWarmupFinished() {};
+
+        virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
+
+        virtual void WarmupCudaRuntimeBuffers(int batch) {}
+
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);
+
+        // 模型可覆盖这三个 hook 来管理不兼容通用 pair<Data, Data> 的历史缓存。
+        virtual bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) { return false; }
+
+        virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) {}
+
+        virtual void TryRecordResponseContext(ResponseContext *context);
+
+        virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
+        virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
+        virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
+        virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
+        virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+
+        virtual void OnResponseContextCreated(ResponseContext *context) {}
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) {}
+
+        virtual bool UseGenericHistoryCache() const { return true; }
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input) = 0; // 根据历史信息和当前输入生成prompt
 
@@ -304,6 +372,11 @@ namespace fastllm {
 
         virtual void UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device);
 
+        // 模型可以覆盖自己的调度器。默认继续使用 basellm 的通用调度逻辑。
+        virtual bool UseModelSpecificScheduler() const { return false; }
+
+        virtual void RunModelSpecificScheduler() { NewMainLoop(); }
+
         // messages: [ (role, content) ... ]
         virtual std::string ApplyChatTemplate(const ChatMessages &messages);
 
@@ -324,6 +397,7 @@ namespace fastllm {
         bool is_multi_modal = false; // 是否是多模态模型
 
         bool use_new_engine = false; // 是否使用新的推理引擎，这是一个过渡变量，未来会删除
+        std::atomic<bool> autoWarmupRunning {false};
 
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt
@@ -351,6 +425,7 @@ namespace fastllm {
 
         std::vector <WeightMergeRule> weightMergeRules;
         std::map <std::string, std::string> specialWeights; //一些特殊层，可以提前注册（一般用于TFACC）
+        std::map <std::string, int> specialWeightLayerIds;
         std::set <std::string> cantQuantLinears; // 不能量化的Linear层
         std::set <std::string> moeLinears;
 
@@ -363,12 +438,24 @@ namespace fastllm {
 
         ResponseContextDict responseContextDict;
 
+        void RemoveResponseContext(int handleId);
+
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;
 
         std::map <std::string, int> deviceMap;
         std::map <std::string, int> moeDeviceMap;
+        std::map <std::string, int> layeredMoeDeviceMap;
+        int moeDeviceLayers = -1;
+
+        void AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId = -1);
+        bool UseLayeredMoeDevice(int layerId) const;
+        std::string SelectMoeDeviceForLayer(int layerId) const;
+        void ApplyMoeDeviceMapForLayer(int layerId) const;
+        bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
+        bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
+        bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;
 
         std::string adapterName;
 
@@ -396,6 +483,7 @@ namespace fastllm {
 
         int kvCacheId = 0; // 最早使用kv_cache的层编号 （因为有一些混合架构的模型，其中一些block是线性attention）
         bool canDoBatchForward = true; // 是否支持batch推理
+        bool canDoConcurrentForward = false; // 不支持batch时是否支持多个上下文轮转推理
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
@@ -404,6 +492,8 @@ namespace fastllm {
 
         // 新推理引擎的主循环
         void NewMainLoop();
+        void GPUMainLoop();
+        void RunNewMainLoop(bool useGPUForward);
     };
 }
 

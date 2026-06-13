@@ -27,6 +27,36 @@ except ImportError:
     )
 
 try:
+    from .qwen35_multimodal_native import (
+        build_qwen35_multimodal_payload,
+        build_qwen35_prompt,
+        normalize_qwen35_conversation,
+        prepare_qwen35_multimodal_inputs,
+    )
+except ImportError:
+    from qwen35_multimodal_native import (
+        build_qwen35_multimodal_payload,
+        build_qwen35_prompt,
+        normalize_qwen35_conversation,
+        prepare_qwen35_multimodal_inputs,
+    )
+
+try:
+    from .step3p7_multimodal_native import (
+        build_step3p7_multimodal_payload,
+        build_step3p7_prompt,
+        normalize_step3p7_conversation,
+        prepare_step3p7_multimodal_inputs,
+    )
+except ImportError:
+    from step3p7_multimodal_native import (
+        build_step3p7_multimodal_payload,
+        build_step3p7_prompt,
+        normalize_step3p7_conversation,
+        prepare_step3p7_multimodal_inputs,
+    )
+
+try:
     import sentencepiece # 先加载sentencepiece，防止libc冲突
 except:
     pass
@@ -227,6 +257,8 @@ else:
 fastllm_lib.has_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.has_device.restype = ctypes.c_bool
 
+fastllm_lib.disable_cuda_malloc.argtypes = []
+
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
@@ -303,8 +335,10 @@ fastllm_lib.add_tokenizer_word_llm_model.argtype = [ctypes.c_int, ctypes.c_char_
 
 fastllm_lib.set_special_tokens_llm_model.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
-fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-fastllm_lib.set_moe_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -444,6 +478,12 @@ def get_cpu_historycache():
 def set_cuda_embedding(cuda_embedding):
     fastllm_lib.set_cuda_embedding(ctypes.c_bool(cuda_embedding));
 
+def set_cuda_slab(mb: int):
+    fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
+
+def disable_cuda_malloc():
+    fastllm_lib.disable_cuda_malloc();
+
 def set_enable_amx(enable_amx):
     fastllm_lib.set_enable_amx(ctypes.c_bool(enable_amx));
 
@@ -492,6 +532,31 @@ def set_device_map(device_map, is_moe = False):
                                (ctypes.c_int * len(device_len))(*device_len),
                                device_str.encode(),
                                (ctypes.c_int * len(values))(*values));
+
+def set_layered_moe_device_map(device_map):
+    devices = [];
+    values = [];
+    if (isinstance(device_map, str)):
+        devices.append(device_map);
+        values.append(1);
+    elif (isinstance(device_map, list)):
+        devices = [str(x) for x in device_map];
+        values = [1 for x in device_map];
+    elif (isinstance(device_map, dict)):
+        devices = [str(x) for x in device_map.keys()];
+        values = [int(device_map[x]) for x in device_map.keys()];
+    else:
+        print("set_layered_moe_device_map error.");
+        return;
+    device_str = ''.join(devices);
+    device_len = [len(x) for x in devices];
+    fastllm_lib.set_layered_moe_device_map(len(device_len),
+                           (ctypes.c_int * len(device_len))(*device_len),
+                           device_str.encode(),
+                           (ctypes.c_int * len(values))(*values));
+
+def set_moe_device_layers(layers: int):
+    fastllm_lib.set_moe_device_layers(ctypes.c_int(layers));
 
 def t2s_decode(safetensors_path, xy_pos, k_cache, v_cache, y, pe):
     bsz = xy_pos.shape[0]
@@ -796,22 +861,133 @@ class TokenizerCache:
             #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
             return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
         else:
-            return tokenizer.encode(prompt, add_special_tokens = True)
+            return encode_hf_prompt(tokenizer, prompt)
+
+def _token_content(value):
+    if isinstance(value, dict):
+        return value.get("content")
+    return value
+
+def _is_step3p5_model_dir(path):
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as f:
+            config = json.load(f)
+        architectures = config.get("architectures", [])
+        architecture = str(architectures[0]) if isinstance(architectures, list) and len(architectures) > 0 else ""
+        model_type = str(config.get("model_type", ""))
+        text_model_type = ""
+        if isinstance(config.get("text_config"), dict):
+            text_model_type = str(config["text_config"].get("model_type", ""))
+        return architecture == "Step3p5ForCausalLM" or model_type == "step3p5" or text_model_type == "step3p5"
+    except Exception:
+        return False
+
+def _attach_local_chat_template(tokenizer, path):
+    if tokenizer is None or not _is_step3p5_model_dir(path):
+        return tokenizer
+    if not getattr(tokenizer, "chat_template", None):
+        template_path = os.path.join(path, "chat_template.jinja")
+        if os.path.exists(template_path):
+            with open(template_path, "r", encoding="utf-8") as f:
+                tokenizer.chat_template = f.read()
+    return tokenizer
+
+def _load_fast_tokenizer_from_tokenizer_json(path):
+    tokenizer_file = os.path.join(path, "tokenizer.json")
+    if not os.path.exists(tokenizer_file):
+        return None
+    from transformers import PreTrainedTokenizerFast
+    kwargs = {"tokenizer_file": tokenizer_file}
+    config_path = os.path.join(path, "tokenizer_config.json")
+    special_path = os.path.join(path, "special_tokens_map.json")
+    for cfg_path in [config_path, special_path]:
+        if not os.path.exists(cfg_path):
+            continue
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            for key in ["bos_token", "eos_token", "pad_token", "unk_token"]:
+                value = _token_content(cfg.get(key))
+                if value is not None and key not in kwargs:
+                    kwargs[key] = value
+        except Exception:
+            pass
+    tokenizer = PreTrainedTokenizerFast(**kwargs)
+    try:
+        tokenizer.name_or_path = path
+    except Exception:
+        pass
+    return _attach_local_chat_template(tokenizer, path)
+
+def encode_hf_prompt(tokenizer, prompt: str):
+    bos_token = getattr(tokenizer, "bos_token", None)
+    avoid_duplicate_bos = getattr(tokenizer, "_fastllm_avoid_duplicate_bos", False)
+    add_special_tokens = not (avoid_duplicate_bos and bos_token and prompt.startswith(bos_token))
+    return tokenizer.encode(prompt, add_special_tokens = add_special_tokens)
+
+def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
+                           tokenize = False, enable_thinking = None, tools = None,
+                           thinking_alias = False):
+    kwargs = {
+        "add_generation_prompt": add_generation_prompt,
+        "tokenize": tokenize,
+    }
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
+        if thinking_alias:
+            kwargs["thinking"] = enable_thinking
+    if tools is not None:
+        kwargs["tools"] = tools
+    try:
+        ret = tokenizer.apply_chat_template(conversation, **kwargs)
+    except TypeError:
+        kwargs.pop("thinking", None)
+        try:
+            ret = tokenizer.apply_chat_template(conversation, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            kwargs.pop("tools", None)
+            ret = tokenizer.apply_chat_template(conversation, **kwargs)
+    if tokenize and hasattr(ret, "keys") and "input_ids" in ret.keys():
+        ret = ret["input_ids"]
+    if tokenize and hasattr(ret, "tolist"):
+        ret = ret.tolist()
+    return ret
 
 def try_load_hf_tokenizer(path):
+    if _is_step3p5_model_dir(path):
+        ret = _load_fast_tokenizer_from_tokenizer_json(path)
+        if ret is not None:
+            return ret
     try:
         import logging
+        import os
         # 1. 保存当前的日志级别
         original_level = logging.root.manager.disable
-        # 2. 完全禁止所有 logging 输出
-        logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
-        from transformers import AutoTokenizer
-        logging.disable(original_level)  # 恢复原来的日志级别
-        ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+        original_use_torch = os.environ.get("USE_TORCH")
+        try:
+            # tokenizer 加载不需要 torch；显式关闭可避免无 torch 环境下 transformers 导入失败
+            os.environ["USE_TORCH"] = "0"
+            # 2. 完全禁止所有 logging 输出
+            logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
+            from transformers import AutoTokenizer
+            ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+        finally:
+            logging.disable(original_level)  # 恢复原来的日志级别
+            if original_use_torch is None:
+                os.environ.pop("USE_TORCH", None)
+            else:
+                os.environ["USE_TORCH"] = original_use_torch
     except:
-        ret = None
-        print("Load AutoTokenizer failed. (you can try install transformers)")
-        print("Try load fastllm tokenizer.")
+        ret = _load_fast_tokenizer_from_tokenizer_json(path) if _is_step3p5_model_dir(path) else None
+        if ret is None:
+            print("Load AutoTokenizer failed. (you can try install transformers)")
+            print("Try load fastllm tokenizer.")
+        else:
+            return ret
+    ret = _attach_local_chat_template(ret, path)
     return ret
 
 class model:
@@ -910,14 +1086,15 @@ class model:
                     if chat_template != "":
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
+                skip_tokenizer = self._has_hf_chat_template()
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
-                        ctypes.c_bool(self.hf_tokenizer != None), model_json.encode())
+                        ctypes.c_bool(skip_tokenizer), model_json.encode())
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
-                        ctypes.c_bool(self.hf_tokenizer != None), lora.encode(),
+                        ctypes.c_bool(skip_tokenizer), lora.encode(),
                         use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt, dtype_config.encode())
                 if os.path.isfile(os.path.join(path, "config.json")):
                     self.config = json.load(open(os.path.join(path, "config.json"), "r"))
@@ -927,6 +1104,32 @@ class model:
                 exit(0)
         if config_base_path is not None:
             self.model_path = config_base_path
+
+        architecture = ""
+        model_type = ""
+        text_model_type = ""
+        if isinstance(getattr(self, "config", None), dict):
+            architectures = self.config.get("architectures")
+            if isinstance(architectures, list) and len(architectures) > 0:
+                architecture = architectures[0]
+            model_type = str(self.config.get("model_type", ""))
+            if isinstance(self.config.get("text_config"), dict):
+                text_model_type = str(self.config["text_config"].get("model_type", ""))
+        self.is_step3p5 = (architecture == "Step3p5ForCausalLM" or
+                           model_type == "step3p5" or
+                           text_model_type == "step3p5")
+        if self.is_step3p5 and self.hf_tokenizer is not None:
+            try:
+                self.hf_tokenizer._fastllm_avoid_duplicate_bos = True
+            except Exception:
+                pass
+        atype = ""
+        if dtype in ("float16", "fp16", "half"):
+            atype = "float16"
+        elif dtype in ("bfloat16", "bf16"):
+            atype = "bfloat16"
+        if atype and (architecture == "Qwen3_5ForConditionalGeneration" or model_type.startswith("qwen3_5")):
+            self.set_atype(atype)
 
         self.direct_query = False;
         self.system_prompt = system_prompt;
@@ -964,6 +1167,39 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+
+    def encode(self, text: str, **kwargs) -> List[int]:
+        output_buffer_init_len = 1024
+        if "tokenizer_encode_string__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
+            self.thread_local_obj.tokenizer_encode_string__output_buffer = (ctypes.c_int * output_buffer_init_len)()
+
+        buffer = self.thread_local_obj.tokenizer_encode_string__output_buffer
+        buffer_len = len(buffer)
+        result_len = fastllm_lib.token_encode_string(self.model, text.encode(), buffer_len, buffer)
+        if result_len > buffer_len:
+            if result_len > 10240:
+                temp_buffer = (ctypes.c_int * result_len)()
+                fastllm_lib.token_encode_string(self.model, text.encode(), result_len, temp_buffer)
+                return [temp_buffer[i] for i in range(result_len)]
+            new_buffer_len = round(math.ceil(result_len / 1024.0)) * 1024
+            buffer = (ctypes.c_int * new_buffer_len)()
+            self.thread_local_obj.tokenizer_encode_string__output_buffer = buffer
+            result_len = fastllm_lib.token_encode_string(self.model, text.encode(), new_buffer_len, buffer)
+        return [buffer[i] for i in range(result_len)]
+
+    def _decode_fastllm_token(self, token_id: int) -> bytes:
+        output_buffer_init_len = 1024
+        if "tokenizer_decode_token__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_decode_token__output_buffer is None:
+            self.thread_local_obj.tokenizer_decode_token__output_buffer = (ctypes.c_char * output_buffer_init_len)()
+
+        buffer = self.thread_local_obj.tokenizer_decode_token__output_buffer
+        buffer_len = len(buffer)
+        result_len = fastllm_lib.token_decode(self.model, token_id, buffer_len, buffer)
+        if result_len > buffer_len:
+            buffer = (ctypes.c_char * result_len)()
+            self.thread_local_obj.tokenizer_decode_token__output_buffer = buffer
+            fastllm_lib.token_decode(self.model, token_id, result_len, buffer)
+        return bytes(buffer.value)
     
     def apply_chat_template(
         self,
@@ -1024,6 +1260,47 @@ class model:
                 outputs[i].append(cur_token)
         return outputs
         
+    def _get_architecture(self) -> str:
+        try:
+            archs = self.config.get("architectures") if isinstance(getattr(self, "config", None), dict) else None
+            if isinstance(archs, list) and len(archs) > 0:
+                return str(archs[0])
+        except Exception:
+            pass
+        return ""
+
+    def _is_deepseek_v4(self) -> bool:
+        if self._get_architecture() == "DeepseekV4ForCausalLM":
+            return True
+        try:
+            mt = self.config.get("model_type", "") if isinstance(getattr(self, "config", None), dict) else ""
+            return str(mt) == "deepseek_v4"
+        except Exception:
+            return False
+
+    def _has_hf_chat_template(self) -> bool:
+        if self.hf_tokenizer is None:
+            return False
+        chat_template = getattr(self.hf_tokenizer, "chat_template", None)
+        return isinstance(chat_template, str) and chat_template != ""
+
+    def _build_messages(self, query: str, history: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+        messages = []
+        if (self.system_prompt != ""):
+            messages.append({"role": "system", "content": self.system_prompt})
+        for his in history:
+            messages.append({"role": "user", "content": his[0]})
+            messages.append({"role": "assistant", "content": his[1]})
+        messages.append({"role": "user", "content": query})
+        return messages
+
+    def _inject_deepseek_v4_tools(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        if not tools:
+            return messages
+        messages = copy.deepcopy(messages)
+        messages.insert(0, {"role": "system", "tools": tools})
+        return messages
+
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
@@ -1031,14 +1308,22 @@ class model:
             history = [];
         messages = []
 
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        # DeepSeek-V4 系列模型未提供 Jinja chat_template，使用官方 encoding_dsv4 编码
+        if (self._is_deepseek_v4() and not self.force_chat_template):
+            from ftllm.encoding_dsv4 import encode_messages
+            thinking_mode = "thinking" if self.enable_thinking else "chat"
+            return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
+
+        if self._has_hf_chat_template():
             if (self.system_prompt != ""):
                 messages.append({"role": "system", "content": self.system_prompt})
             for his in history:
                 messages.append({"role": "user", "content": his[0]})
                 messages.append({"role": "assistant", "content": his[1]})
             messages.append({"role": "user", "content": query})
-            return self.hf_tokenizer.apply_chat_template(messages, tokenize = False, enable_thinking = self.enable_thinking, add_generation_prompt = True)
+            return apply_hf_chat_template(self.hf_tokenizer, messages, tokenize = False,
+                                          enable_thinking = self.enable_thinking,
+                                          add_generation_prompt = True)
         else:
             if (self.system_prompt != ""):
                 messages += ["system", self.system_prompt]
@@ -1096,7 +1381,7 @@ class model:
 
         return [buffer[i] for i in range(result_len)]
     
-    def encode(self, content: str) -> List[int]:
+    def encode(self, content: str, **kwargs) -> List[int]:
         return self.tokenizer_encode_string(content)
     
     def tokenizer_decode_token(self, token_id: int) -> bytes:
@@ -1141,10 +1426,12 @@ class model:
         return conversation
 
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,
-                            enable_thinking = None, images: List = None) -> int:
+                            enable_thinking = None, images: List = None, videos: List = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
-        if images:
+        multimodal_images = list(images or [])
+        multimodal_videos = list(videos or [])
+        if multimodal_images or multimodal_videos:
             architecture = ""
             try:
                 architecture = self.config["architectures"][0]
@@ -1154,23 +1441,94 @@ class model:
                 if self.hf_tokenizer is None:
                     raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
                 gemma_conversation = normalize_gemma4_conversation(
-                    copy.deepcopy(conversation), len(images)
+                    copy.deepcopy(conversation), len(multimodal_images)
                 )
                 native_inputs = prepare_gemma4_multimodal_inputs(
                     tokenizer = self.hf_tokenizer,
                     model_dir = self.model_path if self.model_path else self.hf_tokenizer.name_or_path,
                     model_config = self.config,
                     conversation = gemma_conversation,
-                    images = images,
+                    images = multimodal_images,
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
                 )
                 return len(native_inputs["input_ids"])
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
-            prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
-            return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
+            if architecture == "Qwen3_5ForConditionalGeneration":
+                qwen_conversation = normalize_qwen35_conversation(
+                    copy.deepcopy(conversation),
+                    len(multimodal_images),
+                    len(multimodal_videos),
+                )
+                model_dir = self.model_path if self.model_path else (self.hf_tokenizer.name_or_path if self.hf_tokenizer is not None else "")
+                native_inputs = prepare_qwen35_multimodal_inputs(
+                    tokenizer = self.hf_tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = qwen_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_vision = False,
+                    encode_fn = self.encode,
+                )
+                return len(native_inputs["input_ids"])
+            if architecture == "Step3p7ForConditionalGeneration":
+                step_conversation = normalize_step3p7_conversation(
+                    copy.deepcopy(conversation),
+                    len(multimodal_images),
+                    len(multimodal_videos),
+                )
+                model_dir = self.model_path if self.model_path else (
+                    self.hf_tokenizer.name_or_path if self.hf_tokenizer is not None else ""
+                )
+                native_inputs = prepare_step3p7_multimodal_inputs(
+                    tokenizer = self.hf_tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = step_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_fn = self.encode,
+                )
+                return len(native_inputs["input_ids"])
+        architecture = ""
+        try:
+            architecture = self.config["architectures"][0]
+        except:
+            architecture = ""
+        if self._has_hf_chat_template():
+            input_ids = apply_hf_chat_template(self.hf_tokenizer,
+                                               self.trans_conversation(conversation),
+                                               add_generation_prompt = add_generation_prompt,
+                                               tokenize = True,
+                                               enable_thinking = enable_thinking)
+            return len(input_ids)
         else:
-            prompt = self.apply_chat_template(conversation)
+            if self._is_deepseek_v4() and not self.force_chat_template:
+                from ftllm.encoding_dsv4 import encode_messages
+                thinking_mode = "thinking" if enable_thinking else "chat"
+                prompt = encode_messages(conversation, thinking_mode=thinking_mode)
+            elif architecture == "Qwen3_5ForConditionalGeneration":
+                prompt = build_qwen35_prompt(
+                    tokenizer = None,
+                    conversation = copy.deepcopy(conversation),
+                    image_grid_thw = None,
+                    video_grid_thw = None,
+                    video_timestamps = None,
+                    merge_size = 1,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                )
+            elif architecture == "Step3p7ForConditionalGeneration":
+                prompt = build_step3p7_prompt(
+                    conversation = copy.deepcopy(conversation),
+                    add_generation_prompt = add_generation_prompt,
+                )
+            else:
+                prompt = self.apply_chat_template(conversation)
             return len(self.encode(prompt))
 
     def token_healing(self, 
@@ -1189,7 +1547,7 @@ class model:
         logits = list(range(vocab_size))
         array = (ctypes.c_float * (vocab_size * 4))(*logits)
 
-        common_token = tokenizer.encode(prompt, add_special_tokens = True)
+        common_token = encode_hf_prompt(tokenizer, prompt)
         for i in range(1, len(prompt) - 1):
             cur_prompt = prompt[:-i]
             right_prompt = prompt[len(cur_prompt):]
@@ -1266,9 +1624,9 @@ class model:
                                                            ctypes.c_float(1), ctypes.c_float(1), ctypes.c_bool(True),
                                                            stop_token_len, stop_token_list)
         else:
-            input = tokenizer.encode(prompt, add_special_tokens = True)
+            input = encode_hf_prompt(tokenizer, prompt)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                           1, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list)
+                                                           1, 0, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list)
             vocab_size = len(tokenizer.get_vocab())
         logits = list(range(vocab_size))
         array = (ctypes.c_float * (vocab_size * 4))(*logits)
@@ -1304,7 +1662,7 @@ class model:
         conversation = None
         if (isinstance(query, List)):
             conversation = query
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1318,11 +1676,14 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
-                    #input = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = True)
+                    prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
+                                                    add_generation_prompt = add_generation_prompt,
+                                                    tokenize = False,
+                                                    enable_thinking = self.enable_thinking)
+                    #input = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
-                input = tokenizer.encode(prompt, add_special_tokens = True)
+                input = encode_hf_prompt(tokenizer, prompt)
                 #print("prompt", prompt)
 
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
@@ -1348,19 +1709,45 @@ class model:
         else:
             prompt = ""
             if (conversation != None and len(conversation) != 0):
-                prompt = self.apply_chat_template(conversation)
+                if self._is_deepseek_v4() and not self.force_chat_template:
+                    from ftllm.encoding_dsv4 import encode_messages
+                    thinking_mode = "thinking" if self.enable_thinking else "chat"
+                    prompt = encode_messages(conversation, thinking_mode=thinking_mode)
+                else:
+                    prompt = self.apply_chat_template(conversation)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
-            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+            if (self.save_history):
+                input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
+                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             ctypes.c_int(max_length), ctypes.c_int(0), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list);
+                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+            else:
+                handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                                ctypes.c_int(max_length), ctypes.c_int(0), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                                ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                                stop_token_len, stop_token_list);
             res = "";
             ret = b'';
+            pending_tokens = []
             fail_cnt = 0;
             while True:
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
+                if (self.save_history):
+                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                    if (token <= -1):
+                        try:
+                            cur_cache = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur_cache[0], cur_cache[1])
+                        except:
+                            pass
+                        break
+                    ret += self._decode_fastllm_token(token)
+                    pending_tokens.append(token)
+                else:
+                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
                 cur = "";
                 try:
                     cur = ret.decode();
@@ -1374,6 +1761,10 @@ class model:
                 fail_cnt = 0;
                 if (cur == "<flmeos>"):
                     break;
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(cur)
+                    self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
+                    pending_tokens.clear()
                 if one_by_one:
                     yield cur;
                 else:
@@ -1384,7 +1775,7 @@ class model:
                         prompt: str):
         if (self.hf_tokenizer != None):
             tokenizer = self.hf_tokenizer
-            input = tokenizer.encode(prompt, add_special_tokens = True);
+            input = encode_hf_prompt(tokenizer, prompt);
             fastllm_lib.add_cache_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input));
         else:
             print("add_cache failed: need hf_tokenizer.")
@@ -1396,7 +1787,7 @@ class model:
                         max_length: int = 8192, min_length: int = 0, do_sample = True, 
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
-                        images: List = None, tools: List = None, enable_thinking = None):
+                        images: List = None, videos: List = None, tools: List = None, enable_thinking = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         conversation = None
@@ -1408,7 +1799,9 @@ class model:
         #print("conversation", conversation)
         #print("tools", tools)
 
-        if (images != None):
+        multimodal_images = list(images or [])
+        multimodal_videos = list(videos or [])
+        if (len(multimodal_images) > 0 or len(multimodal_videos) > 0):
             architecture = ""
             try:
                 architecture = self.config["architectures"][0]
@@ -1416,6 +1809,9 @@ class model:
                 print("Error: can't detect architectures for this model.")
                 exit(0)
             if (architecture == "CogVLMForCausalLM"):
+                if (len(multimodal_videos) > 0):
+                    print("Error: CogVLM multimodal only supports images.")
+                    exit(0)
                 image_channels = int(self.config["vision_config"]["in_channels"])
                 image_size = int(self.config["vision_config"]["image_size"])
                 configs = {
@@ -1434,14 +1830,17 @@ class model:
                         transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
                     ]
                 )
-                image = transform(images[0]).reshape([-1]).tolist()
+                image = transform(multimodal_images[0]).reshape([-1]).tolist()
                 tokenizer = self.hf_tokenizer
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
+                    prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
+                                                    add_generation_prompt = add_generation_prompt,
+                                                    tokenize = False,
+                                                    enable_thinking = enable_thinking)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
-                input = tokenizer.encode(prompt, add_special_tokens = True)
+                input = encode_hf_prompt(tokenizer, prompt)
                 stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
                 handle = fastllm_lib.launch_response_llm_model_multimodal(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             des.encode(), (ctypes.c_float * len(image))(*image),
@@ -1456,12 +1855,12 @@ class model:
 
                 gemma_conversation = None
                 if (conversation != None and len(conversation) != 0):
-                    gemma_conversation = normalize_gemma4_conversation(copy.deepcopy(conversation), len(images))
+                    gemma_conversation = normalize_gemma4_conversation(copy.deepcopy(conversation), len(multimodal_images))
                 else:
                     prompt_text = query if self.direct_query else self.get_prompt(query, history)
                     gemma_conversation = normalize_gemma4_conversation(
                         [{"role": "user", "content": prompt_text}],
-                        len(images),
+                        len(multimodal_images),
                     )
 
                 native_inputs = prepare_gemma4_multimodal_inputs(
@@ -1469,7 +1868,7 @@ class model:
                     model_dir = self.model_path if self.model_path else tokenizer.name_or_path,
                     model_config = self.config,
                     conversation = gemma_conversation,
-                    images = images,
+                    images = multimodal_images,
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
                 )
@@ -1484,11 +1883,94 @@ class model:
                     False, stop_token_len, stop_token_list
                 )
                 return handle
+            elif (architecture == "Qwen3_5ForConditionalGeneration"):
+                tokenizer = self.hf_tokenizer
+                qwen_conversation = None
+                if (conversation != None and len(conversation) != 0):
+                    qwen_conversation = normalize_qwen35_conversation(
+                        copy.deepcopy(conversation),
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+                else:
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    qwen_conversation = normalize_qwen35_conversation(
+                        [{"role": "user", "content": prompt_text}],
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+
+                model_dir = self.model_path if self.model_path else (tokenizer.name_or_path if tokenizer is not None else "")
+                native_inputs = prepare_qwen35_multimodal_inputs(
+                    tokenizer = tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = qwen_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_fn = self.encode,
+                )
+                payload_config, payload = build_qwen35_multimodal_payload(
+                    native_inputs, tokenizer, model_config = self.config
+                )
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
+                return handle
+            elif (architecture == "Step3p7ForConditionalGeneration"):
+                tokenizer = self.hf_tokenizer
+                if (conversation != None and len(conversation) != 0):
+                    step_conversation = normalize_step3p7_conversation(
+                        copy.deepcopy(conversation),
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+                else:
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    step_conversation = normalize_step3p7_conversation(
+                        [{"role": "user", "content": prompt_text}],
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+
+                model_dir = self.model_path if self.model_path else (tokenizer.name_or_path if tokenizer is not None else "")
+                native_inputs = prepare_step3p7_multimodal_inputs(
+                    tokenizer = tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = step_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_fn = self.encode,
+                )
+                payload_config, payload = build_step3p7_multimodal_payload(native_inputs)
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
+                return handle
             else:
                 print("Error: can't support architectures: " + architecture)
                 exit(0)
 
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1502,14 +1984,18 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, 
-                        enable_thinking = enable_thinking, thinking = enable_thinking, tools = tools)
+                    prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
+                                                    add_generation_prompt = add_generation_prompt,
+                                                    tokenize = False,
+                                                    enable_thinking = enable_thinking,
+                                                    tools = tools,
+                                                    thinking_alias = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
                 if (self.save_history):
                     input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
                 else:
-                    input = tokenizer.encode(prompt, add_special_tokens = True)
+                    input = encode_hf_prompt(tokenizer, prompt)
                 #print("prompt", prompt[:100])
                 #print("input", input[:100])
 
@@ -1522,15 +2008,45 @@ class model:
             return handle
         else:
             prompt = ""
+            architecture = ""
+            try:
+                architecture = self.config["architectures"][0]
+            except:
+                architecture = ""
             if (conversation != None and len(conversation) != 0):
-                prompt = self.apply_chat_template(conversation)
+                if architecture == "Qwen3_5ForConditionalGeneration":
+                    prompt = build_qwen35_prompt(
+                        tokenizer = None,
+                        conversation = copy.deepcopy(conversation),
+                        image_grid_thw = None,
+                        video_grid_thw = None,
+                        video_timestamps = None,
+                        merge_size = 1,
+                        add_generation_prompt = add_generation_prompt,
+                        enable_thinking = enable_thinking,
+                    )
+                elif self._is_deepseek_v4() and not self.force_chat_template:
+                    from ftllm.encoding_dsv4 import encode_messages
+                    thinking_mode = "thinking" if enable_thinking else "chat"
+                    conversation = self._inject_deepseek_v4_tools(conversation, tools)
+                    prompt = encode_messages(conversation, thinking_mode=thinking_mode)
+                else:
+                    prompt = self.apply_chat_template(conversation)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
-            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+            if (self.save_history):
+                input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
+                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list)
+                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+            else:
+                handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                                ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                                ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                                stop_token_len, stop_token_list)
             return handle
     
     def abort_handle(self, handle):
@@ -1544,7 +2060,7 @@ class model:
         fastllm_lib.abort_response_llm_model(self.model, handle)
     
     def stream_response_handle(self, handle):
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
@@ -1567,11 +2083,24 @@ class model:
         else:
             res = ""
             ret = b''
+            pending_tokens = []
             fail_cnt = 0
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     continue
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                    if (token <= -1):
+                        try:
+                            cur_cache = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur_cache[0], cur_cache[1])
+                        except:
+                            pass
+                        break
+                    ret += self._decode_fastllm_token(token)
+                    pending_tokens.append(token)
+                else:
+                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -1585,6 +2114,10 @@ class model:
                 fail_cnt = 0
                 if (cur == "<flmeos>"):
                     break
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(cur)
+                    self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
+                    pending_tokens.clear()
                 yield cur
 
     async def stream_response_handle_async(self, handle):
@@ -1592,7 +2125,7 @@ class model:
         is_prefill = True
         start_time = time.time()
 
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
@@ -1632,12 +2165,25 @@ class model:
         else:
             res = ""
             ret = b''
+            pending_tokens = []
             fail_cnt = 0
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     await asyncio.sleep(0)
                     continue
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                    if (token <= -1):
+                        try:
+                            cur = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur[0], cur[1])
+                        except:
+                            pass
+                        break
+                    ret += self._decode_fastllm_token(token)
+                    pending_tokens.append(token)
+                else:
+                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -1651,6 +2197,10 @@ class model:
                 fail_cnt = 0
                 if (cur == "<flmeos>"):
                     break
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(cur)
+                    self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
+                    pending_tokens.clear()
                 yield cur
                     
     async def stream_response_async(self,
@@ -1698,7 +2248,7 @@ class model:
         if (not(history)):
             history = [];
         prompt = query if self.direct_query else self.get_prompt(query, history);
-        input = tokenizer.encode(prompt, add_special_tokens = True);
+        input = encode_hf_prompt(tokenizer, prompt);
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                        max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty,
@@ -1730,7 +2280,7 @@ class model:
             input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
         else:
             prompt = query if self.direct_query else self.get_prompt(query, history);
-            input = tokenizer.encode(prompt, add_special_tokens = True);
+            input = encode_hf_prompt(tokenizer, prompt);
 
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),

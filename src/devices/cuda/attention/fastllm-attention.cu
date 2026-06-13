@@ -1,7 +1,17 @@
 //
 // Created by huangyuyang on 1/21/26.
 //
+
+// FlashInfer 依赖 cuda/std/barrier 等同步原语（要求 sm_70+），其头文件在 sm_70 以下的
+// device 编译 pass（如 sm_60）中会直接 #error。为兼容多 CUDA_ARCH 一起编译，这里仅在
+// host pass 与 sm_70+ 的 device pass 中启用 FlashInfer；sm_70 以下的 device pass 完全
+// 排除 FlashInfer 代码，运行期由原生分页注意力兜底。
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
+#define FASTLLM_ENABLE_FLASHINFER
+#endif
+
 // FlashInfer includes
+#ifdef FASTLLM_ENABLE_FLASHINFER
 #include "attention_impl.cuh"
 #include "attention/default_prefill_params.cuh"
 #include "attention/variants.cuh"
@@ -11,14 +21,18 @@
 #include "fastdiv.cuh"
 #include "pos_enc.cuh"
 #include "utils.cuh"
+#endif
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 #include "utils/utils.h"
+#include "attention/fastllm-attention-dtype.cuh"
+#include "attention/fastllm-paged-attention-native.cuh"
 
 #include <cstdlib>
 #include <cuda_fp8.h>
 #include <map>
+#include <memory>
 #include <mutex>
 
 template <int BN, int BM, int BK>
@@ -911,7 +925,9 @@ extern bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axi
 
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                               const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
+#ifdef FASTLLM_ENABLE_FLASHINFER
     using namespace flashinfer;
+#endif
     
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
     half *qd = (half*)q.cudaData;
@@ -959,13 +975,15 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     uint32_t head_dim_vo = v2;           // VO head dimension
     
     // 确定 mask mode - FlashInfer 的 custom mask 需要 bit-packed 格式，暂时不支持
-    MaskMode mask_mode = MaskMode::kNone;
     bool use_custom_mask = (maskd != nullptr);
 // printf("maskType = %d, use_custom_mask = %d, batch = %d\n", maskType, use_custom_mask, batch);
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    MaskMode mask_mode = MaskMode::kNone;
     if (maskType == 0 && !use_custom_mask && batch == 1) {
         mask_mode = MaskMode::kCausal;
     }
 mask_mode = MaskMode::kCausal;
+#endif
     // 注意：FlashInfer 的 custom mask 格式与 fastllm 不同，暂时禁用
     if (use_custom_mask) {
         // Fallback 到原始实现，因为 mask 格式不兼容
@@ -977,7 +995,12 @@ mask_mode = MaskMode::kCausal;
     // 对于 HND 布局：
     // - stride_n (token 之间的 stride) = head_dim
     // - stride_h (head 之间的 stride) = seq_len * head_dim
-    bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask);
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask) &&
+                          FastllmCudaFlashInferSupported();
+#else
+    bool use_flashinfer = false;
+#endif
 // use_flashinfer = false;
     // 调试信息：打印参数值
     if (use_flashinfer) {
@@ -985,6 +1008,7 @@ mask_mode = MaskMode::kCausal;
         // printf("  num_kv_heads=%u, num_qo_heads=%u, actual_batch=%u, qo_len=%u, kv_len=%u\n", num_kv_heads, num_qo_heads, actual_batch, qo_len, kv_len);
     }
     
+#ifdef FASTLLM_ENABLE_FLASHINFER
     if (use_flashinfer) {
         // 为每个 batch item 调用 FlashInfer
         // q0 = batch * num_qo_heads，所以需要按 batch 循环
@@ -1088,6 +1112,7 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
             return true;
         }
     }
+#endif
     
     // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
@@ -1249,6 +1274,13 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
         if (maskd) {
             int spatial = q1 * k1, n = batch, m = q0 / batch;
             FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(qk, maskd, __float2half_rn(-10000), n, m, spatial);
+        } else if (batch == 1 && maskType == 0 && q1 > 1) {
+            // 没有显式 mask 且为 prefill（q1>1）时按因果方式屏蔽未来 token。
+            // qk 物理布局为 [q0, q1, k1]，对每个 head 单独应用因果 mask。
+            // base=k1-q1 使 query 行 r 可见 key [0, k1-q1+r]（兼容带历史上下文的分块 prefill）。
+            for (int h = 0; h < q0; h++) {
+                CausalMask<256, half> <<< q1, 256 >>>(qk + (size_t)h * q1 * k1, __float2half_rn(-10000.0f), q1, k1, k1 - q1);
+            }
         }
 
         int outer = q0 * q1;
@@ -1751,47 +1783,6 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
     return true;
 }
 
-template <typename T>
-__device__ __forceinline__ float FastllmAttentionValueToFloat(T value);
-
-template <>
-__device__ __forceinline__ float FastllmAttentionValueToFloat<float>(float value) {
-    return value;
-}
-
-template <>
-__device__ __forceinline__ float FastllmAttentionValueToFloat<half>(half value) {
-    return __half2float(value);
-}
-
-template <>
-__device__ __forceinline__ float FastllmAttentionValueToFloat<__nv_bfloat16>(__nv_bfloat16 value) {
-    return __bfloat162float(value);
-}
-
-template <typename T>
-__device__ __forceinline__ T FastllmAttentionFloatToValue(float value);
-
-template <>
-__device__ __forceinline__ float FastllmAttentionFloatToValue<float>(float value) {
-    return value;
-}
-
-template <>
-__device__ __forceinline__ half FastllmAttentionFloatToValue<half>(float value) {
-    return __float2half(value);
-}
-
-template <>
-__device__ __forceinline__ __nv_bfloat16 FastllmAttentionFloatToValue<__nv_bfloat16>(float value) {
-    return __float2bfloat16_rn(value);
-}
-
-template <>
-__device__ __forceinline__ __nv_fp8_e4m3 FastllmAttentionFloatToValue<__nv_fp8_e4m3>(float value) {
-    return __nv_fp8_e4m3(value);
-}
-
 // CUDA kernel for copying data from input to paged KV cache
 // input: [numHeads, seqLen, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
 template <typename SrcT, typename DstT, int THREAD_PER_BLOCK>
@@ -1991,7 +1982,8 @@ static void FastllmCudaPagedCacheCopyBatchTyped(
     int batch,
     int numHeads,
     int headDim,
-    uint8_t *inputData) {
+    uint8_t *inputData,
+    bool sync) {
     int totalElements = batch * numHeads * headDim;
     if (totalElements == 0) {
         return;
@@ -2004,7 +1996,9 @@ static void FastllmCudaPagedCacheCopyBatchTyped(
         pagedData, pageIdxArray, pageOffsetArray, pageLen, batch, numHeads, headDim, inputData
     );
 
-    DeviceSync();
+    if (sync) {
+        DeviceSync();
+    }
 }
 
 // Host function to launch the batch kernel
@@ -2018,52 +2012,53 @@ void FastllmCudaPagedCacheCopyBatch(
     int headDim,
     fastllm::DataType dstType,
     uint8_t *inputData,
-    fastllm::DataType srcType) {
+    fastllm::DataType srcType,
+    bool sync) {
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<float, float>(pagedData, pageIdxArray, pageOffsetArray,
-                                                              pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<float, half>(pagedData, pageIdxArray, pageOffsetArray,
-                                                             pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<float, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                      pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedCacheCopyBatchTyped<float, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                      pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
         }
     } else if (srcType == fastllm::DataType::FLOAT16) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<half, float>(pagedData, pageIdxArray, pageOffsetArray,
-                                                             pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<half, half>(pagedData, pageIdxArray, pageOffsetArray,
-                                                            pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<half, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                     pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedCacheCopyBatchTyped<half, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                     pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
         }
     } else if (srcType == fastllm::DataType::BFLOAT16) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, float>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                      pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, half>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                     pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                              pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                              pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
         }
@@ -2139,6 +2134,138 @@ FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     return *ptr;
 }
 
+static FlashInferWorkSpaceManager *tryGetFastllmFlashInferWorkSpace(int id) {
+    std::lock_guard<std::mutex> guard(s_fastllmFlashInferWorkSpaceMapLock);
+    auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
+    return it == s_fastllmFlashInferWorkSpaceMap.end() ? nullptr : it->second.get();
+}
+
+void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
+    FlashInferWorkSpaceManager &workspace = getFastllmFlashInferWorkSpace();
+    if (outSize != nullptr) {
+        *outSize = workspace.float_workspace_size;
+    }
+    return workspace.d_float_workspace;
+}
+
+struct FastllmCudaTempDeviceBuffer {
+    int device = -1;
+    void *data = nullptr;
+    size_t size = 0;
+
+    explicit FastllmCudaTempDeviceBuffer(int device) : device(device) {}
+
+    ~FastllmCudaTempDeviceBuffer() {
+        if (data == nullptr) {
+            return;
+        }
+        int oldDevice = -1;
+        cudaGetDevice(&oldDevice);
+        cudaSetDevice(device);
+        FastllmCudaDirectFree(data);
+        if (oldDevice >= 0) {
+            cudaSetDevice(oldDevice);
+        }
+    }
+};
+
+static std::map<int, std::unique_ptr<FastllmCudaTempDeviceBuffer>> s_fastllmCudaTempBuffers;
+// s_fastllmCudaTempBuffersMapLock 仅保护 map 结构本身（查找/插入），
+// 持锁期间绝不调用任何 CUDA API，避免跨设备线程互相阻塞。
+static std::mutex s_fastllmCudaTempBuffersMapLock;
+// 每个设备一把锁：缓冲区的 malloc/free（会触发本设备同步）只在对应设备锁内进行，
+// 不会阻塞其它设备线程。这是张量并行下避免死锁的关键：
+// 否则一个 rank 在持有全局锁时执行 cudaFree（隐式同步本设备），
+// 而本设备 stream 上挂着需要其它 rank 共同完成的 NCCL 集合通信，
+// 其它 rank 又卡在等待这把全局锁，从而形成跨 rank 死锁。
+static std::map<int, std::unique_ptr<std::mutex>> s_fastllmCudaTempBufferDeviceLocks;
+
+static FastllmCudaTempDeviceBuffer *FastllmGetCudaTempBufferHolder(int id, std::mutex **outDeviceLock) {
+    std::lock_guard<std::mutex> guard(s_fastllmCudaTempBuffersMapLock);
+    auto &holder = s_fastllmCudaTempBuffers[id];
+    if (holder == nullptr) {
+        holder = std::make_unique<FastllmCudaTempDeviceBuffer>(id);
+    }
+    auto &deviceLock = s_fastllmCudaTempBufferDeviceLocks[id];
+    if (deviceLock == nullptr) {
+        deviceLock = std::make_unique<std::mutex>();
+    }
+    if (outDeviceLock != nullptr) {
+        *outDeviceLock = deviceLock.get();
+    }
+    return holder.get();
+}
+
+static size_t FastllmCudaTempAlignBytes(size_t size) {
+    const size_t align = 256;
+    return ((size + align - 1) / align) * align;
+}
+
+void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outOwn) {
+    if (outOwn != nullptr) {
+        *outOwn = false;
+    }
+    if (needBytes == 0) {
+        needBytes = 1;
+    }
+
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    checkCudaErrors("Error: CUDA error when find device!", state);
+
+    FlashInferWorkSpaceManager *workspace = tryGetFastllmFlashInferWorkSpace(id);
+    if (workspace != nullptr && workspace->d_float_workspace != nullptr &&
+        workspace->cached_float_workspace_size >= needBytes) {
+        if (outBytes != nullptr) {
+            *outBytes = workspace->cached_float_workspace_size;
+        }
+        return workspace->d_float_workspace;
+    }
+
+    std::mutex *deviceLock = nullptr;
+    FastllmCudaTempDeviceBuffer *holderPtr = FastllmGetCudaTempBufferHolder(id, &deviceLock);
+    std::lock_guard<std::mutex> guard(*deviceLock);
+    FastllmCudaTempDeviceBuffer &holder = *holderPtr;
+
+    size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
+    if (holder.size < allocBytes) {
+        if (holder.data != nullptr) {
+            FastllmCudaDirectFree(holder.data);
+            holder.data = nullptr;
+            holder.size = 0;
+        }
+        holder.data = FastllmCudaDirectMalloc(allocBytes);
+        if (holder.data == nullptr) {
+            holder.size = 0;
+            if (outBytes != nullptr) {
+                *outBytes = 0;
+            }
+            return nullptr;
+        }
+        holder.size = allocBytes;
+    }
+
+    if (outBytes != nullptr) {
+        *outBytes = holder.size;
+    }
+    return holder.data;
+}
+
+void FastllmReleaseCudaTempBuffer(void *ptr, bool own) {
+    if (own && ptr != nullptr) {
+        FastllmCudaFree(ptr);
+    }
+}
+
+void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn) {
+    return FastllmBorrowCudaTempBuffer(needBytes, outBytes, outOwn);
+}
+
+void FastllmReleaseDequantScratch(void *ptr, bool own) {
+    FastllmReleaseCudaTempBuffer(ptr, own);
+}
+
+#ifdef FASTLLM_ENABLE_FLASHINFER
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename DType, typename Params>
 static cudaError_t FastllmDispatchPagedPrefillKernel(Params &prefill_params, DType *tmp_v, float *tmp_s,
                                                      bool enable_pdl, cudaStream_t stream) {
@@ -2194,8 +2321,15 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
             return cudaErrorNotSupported;
     }
 }
+#endif
 
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
+#ifndef FASTLLM_ENABLE_FLASHINFER
+    return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
+#else
+    if (!FastllmCudaFlashInferSupported()) {
+        return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
+    }
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
 // ForceDeviceSync(); auto st = std::chrono::system_clock::now();
@@ -2454,9 +2588,26 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     
     DeviceSync();
     return true;
+#endif
 }
 
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync) {
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph) {
+#ifndef FASTLLM_ENABLE_FLASHINFER
+    bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+        q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
+    if (sync) {
+        DeviceSync();
+    }
+    return ok;
+#else
+    if (!FastllmCudaFlashInferSupported()) {
+        bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
+        if (sync) {
+            DeviceSync();
+        }
+        return ok;
+    }
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     
@@ -2501,6 +2652,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
     int headDim = pagedKVCacheK->dims[3];
     int valueHeadDim = pagedKVCacheV->dims[3];
+    bool useFlashInferCudaGraph = flashInferCudaGraph < 0 ? enableCudaGraph : (flashInferCudaGraph != 0);
     
     // 检查数据类型
     if (q.dataType != fastllm::DataType::FLOAT16 && q.dataType != fastllm::DataType::BFLOAT16) {
@@ -2566,29 +2718,129 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
-        cudaStream_t stream = nullptr;
-        thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
-        thread_local static std::map<int, bool> plan_inited_map;
+        cudaStream_t stream = cudaStreamPerThread;
+        static std::mutex plan_cache_mutex;
+        static std::map<int, PrefillPlanInfo> plan_info_map;
+        static std::map<int, std::vector<uint32_t>> plan_key_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
-        if (!inited || !plan_inited_map[current_device_id]) {
-            cudaError_t plan_status = PrefillPlan<uint32_t>(
-                workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-                workspace.int_workspace_size, plan_info_map[current_device_id], 
-                (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
-                total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
-                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
-                /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
-                /*num_colocated_ctas=*/0, stream);
-            
-            if (plan_status != cudaSuccess) {
-                printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
-                cudaStreamSynchronize(stream);
-                exit(0);
-            }
-            plan_inited_map[current_device_id] = true;
+
+        std::vector<uint32_t> plan_key;
+        plan_key.reserve(10 + (batch_size + 1) * 2);
+        plan_key.push_back(total_num_rows);
+        plan_key.push_back(batch_size);
+        plan_key.push_back(num_qo_heads_per_batch);
+        plan_key.push_back((uint32_t)numHeads);
+        plan_key.push_back((uint32_t)headDim);
+        plan_key.push_back((uint32_t)valueHeadDim);
+        plan_key.push_back((uint32_t)pageLen);
+        plan_key.push_back((uint32_t)sizeof(QType));
+        plan_key.push_back((uint32_t)sizeof(KVType));
+        plan_key.push_back(useFlashInferCudaGraph ? 1U : 0U);
+        for (uint32_t i = 0; i <= batch_size; i++) {
+            plan_key.push_back((uint32_t)qSizes.cpuIntDatas[i]);
         }
-        PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
+        for (uint32_t i = 0; i <= batch_size; i++) {
+            plan_key.push_back((uint32_t)pageSizes.cpuIntDatas[i]);
+        }
+
+        struct GraphPrefillPlanCacheEntry {
+            PrefillPlanInfo plan_info;
+            void *d_int_plan = nullptr;
+            size_t int_plan_bytes = 0;
+
+            ~GraphPrefillPlanCacheEntry() {
+                if (d_int_plan != nullptr) {
+                    FastllmCudaFree(d_int_plan);
+                }
+            }
+        };
+
+        auto planIntBytes = [&](const PrefillPlanInfo &info) -> size_t {
+            auto endOf = [](int64_t offset, size_t bytes) -> size_t {
+                return offset <= 0 ? 0 : (size_t)offset + bytes;
+            };
+            size_t bytes = 0;
+            bytes = std::max(bytes, endOf(info.request_indices_offset,
+                                          (size_t)info.padded_batch_size * sizeof(uint32_t)));
+            bytes = std::max(bytes, endOf(info.qo_tile_indices_offset,
+                                          (size_t)info.padded_batch_size * sizeof(uint32_t)));
+            bytes = std::max(bytes, endOf(info.kv_tile_indices_offset,
+                                          (size_t)info.padded_batch_size * sizeof(uint32_t)));
+            bytes = std::max(bytes, endOf(info.o_indptr_offset,
+                                          (size_t)(batch_size + 1) * sizeof(uint32_t)));
+            bytes = std::max(bytes, endOf(info.kv_chunk_size_ptr_offset, sizeof(uint32_t)));
+            if (info.enable_cuda_graph) {
+                bytes = std::max(bytes, endOf(info.total_num_rows_offset, sizeof(uint32_t)));
+            }
+            if (info.split_kv) {
+                bytes = std::max(bytes, endOf(info.merge_indptr_offset,
+                                              (size_t)(info.total_num_rows + 1) * sizeof(uint32_t)));
+                bytes = std::max(bytes, endOf(info.block_valid_mask_offset,
+                                              (size_t)info.padded_batch_size * sizeof(bool)));
+            }
+            return bytes;
+        };
+
+        PrefillPlanInfo plan_info;
+        void *plan_int_base = workspace.d_int_workspace;
+        {
+            std::lock_guard<std::mutex> guard(plan_cache_mutex);
+            static std::map<int, std::map<std::vector<uint32_t>, std::shared_ptr<GraphPrefillPlanCacheEntry>>> graph_plan_cache;
+            if (enableCudaGraph) {
+                auto &device_cache = graph_plan_cache[current_device_id];
+                auto cache_it = device_cache.find(plan_key);
+                if (cache_it == device_cache.end()) {
+                    PrefillPlanInfo created_plan_info;
+                    cudaError_t plan_status = PrefillPlan<uint32_t>(
+                        workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+                        workspace.int_workspace_size, created_plan_info,
+                        (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(),
+                        total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                        pageLen, useFlashInferCudaGraph, /*sizeof_dtype_o=*/sizeof(QType),
+                        /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false,
+                        /*num_colocated_ctas=*/0, stream);
+
+                    if (plan_status != cudaSuccess) {
+                        printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
+                        exit(0);
+                    }
+                    auto entry = std::make_shared<GraphPrefillPlanCacheEntry>();
+                    entry->plan_info = created_plan_info;
+                    entry->int_plan_bytes = planIntBytes(created_plan_info);
+                    entry->d_int_plan = FastllmCudaMalloc(entry->int_plan_bytes);
+                    cudaError_t copy_status = cudaMemcpyAsync(entry->d_int_plan, workspace.d_int_workspace,
+                                                              entry->int_plan_bytes, cudaMemcpyDeviceToDevice, stream);
+                    if (copy_status != cudaSuccess) {
+                        printf("FastllmCudaHalfPagedAttentionBatch: graph plan copy failed: %s\n",
+                               cudaGetErrorString(copy_status));
+                        exit(0);
+                    }
+                    cache_it = device_cache.emplace(plan_key, entry).first;
+                }
+                plan_info = cache_it->second->plan_info;
+                plan_int_base = cache_it->second->d_int_plan;
+            } else if (plan_key_map.find(current_device_id) == plan_key_map.end() ||
+                       plan_key_map[current_device_id] != plan_key) {
+                cudaError_t plan_status = PrefillPlan<uint32_t>(
+                    workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+                    workspace.int_workspace_size, plan_info_map[current_device_id],
+                    (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(),
+                    total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                    pageLen, useFlashInferCudaGraph, /*sizeof_dtype_o=*/sizeof(QType),
+                    /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false,
+                    /*num_colocated_ctas=*/0, stream);
+
+                if (plan_status != cudaSuccess) {
+                    printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
+                    exit(0);
+                }
+                plan_key_map[current_device_id] = plan_key;
+                plan_info = plan_info_map[current_device_id];
+            } else {
+                plan_info = plan_info_map[current_device_id];
+            }
+        }
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
@@ -2602,23 +2854,31 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         );
         
         prefill_params.request_indices = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.request_indices_offset);
+            static_cast<uint8_t*>(plan_int_base) + plan_info.request_indices_offset);
         prefill_params.qo_tile_indices = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.qo_tile_indices_offset);
+            static_cast<uint8_t*>(plan_int_base) + plan_info.qo_tile_indices_offset);
         prefill_params.kv_tile_indices = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.kv_tile_indices_offset);
+            static_cast<uint8_t*>(plan_int_base) + plan_info.kv_tile_indices_offset);
         prefill_params.o_indptr = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.o_indptr_offset);
+            static_cast<uint8_t*>(plan_int_base) + plan_info.o_indptr_offset);
         prefill_params.kv_chunk_size_ptr = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.kv_chunk_size_ptr_offset);
+            static_cast<uint8_t*>(plan_int_base) + plan_info.kv_chunk_size_ptr_offset);
         prefill_params.padded_batch_size = plan_info.padded_batch_size;
         prefill_params.max_total_num_rows = plan_info.total_num_rows;
+        if (plan_info.enable_cuda_graph) {
+            prefill_params.total_num_rows = reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(plan_int_base) + plan_info.total_num_rows_offset);
+        }
         
         QType *tmp_v = nullptr;
         float *tmp_s = nullptr;
         if (plan_info.split_kv) {
             prefill_params.merge_indptr = reinterpret_cast<uint32_t*>(
-                static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.merge_indptr_offset);
+                static_cast<uint8_t*>(plan_int_base) + plan_info.merge_indptr_offset);
+            if (plan_info.enable_cuda_graph) {
+                prefill_params.block_valid_mask = reinterpret_cast<bool*>(
+                    static_cast<uint8_t*>(plan_int_base) + plan_info.block_valid_mask_offset);
+            }
             tmp_v = reinterpret_cast<QType*>(
                 static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.v_offset);
             tmp_s = reinterpret_cast<float*>(
@@ -2658,10 +2918,15 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         DeviceSync();
     }
     return true;
+#endif
 }
 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
                          fastllm::Data &output, float softmaxScale) {
+#ifndef FASTLLM_ENABLE_FLASHINFER
+    // FlashInfer 不可用（sm_70 以下），分页 MLA 暂无原生实现。
+    return false;
+#else
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     if (!kvCachePaged.isPagedKVCache || !peCachePaged.isPagedKVCache) return false;
@@ -2760,4 +3025,5 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     if (status != cudaSuccess) return false;
     DeviceSync();
     return true;
+#endif
 }

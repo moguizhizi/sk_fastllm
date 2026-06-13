@@ -38,7 +38,11 @@ option(BUILD_CLI "build cli" OFF)
 option(UNIT_TEST "build unit tests" OFF)
 
 if(NOT DEFINED CUDA_ARCH)
-    set(CUDA_ARCH "native")
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(CUDA_ARCH "native")
+    endif()
 endif()
 
 # ROCm device detection function
@@ -215,13 +219,13 @@ file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
-        src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
+        src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
-        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp
+        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/qwen3_next.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/gpt_oss.cpp
-        src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp
+        src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
         third_party/gguf/gguf-adapter.cpp
@@ -234,6 +238,7 @@ include_directories(include/utils)
 include_directories(include/models)
 include_directories(include/blocks)
 include_directories(include/devices/cpu)
+include_directories(include/devices/disk)
 include_directories(third_party/json11)
 include_directories(third_party/gguf)
 include_directories(third_party/flashinfer)
@@ -250,6 +255,35 @@ endif()
 
 if (USE_CUDA)
     enable_language(CUDA)
+    if (CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CUDA_FLAGS_RELEASE STREQUAL "")
+        set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "CUDA release flags" FORCE)
+    endif()
+    if ("cuda_std_20" IN_LIST CMAKE_CUDA_COMPILE_FEATURES)
+        set(CMAKE_CUDA_STANDARD 20)
+    else()
+        set(CMAKE_CUDA_STANDARD 17)
+        message(STATUS "CUDA20 is unavailable for this CMake/NVCC combination, falling back to CUDA17")
+    endif()
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+    # TurboMind s884 内核（third_party/turbomind）依赖这些 nvcc 特性。
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    set(FASTLLM_CUDA_ARCHITECTURES ${CUDA_ARCH})
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "")
+        foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+            if (FASTLLM_CUDA_ARCH STREQUAL "120")
+                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "120f")
+            elseif (FASTLLM_CUDA_ARCH STREQUAL "121")
+                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "121f")
+            else()
+                list(APPEND FASTLLM_CUDA_ARCHITECTURES_NORMALIZED "${FASTLLM_CUDA_ARCH}")
+            endif()
+        endforeach()
+        set(FASTLLM_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES_NORMALIZED})
+    endif()
+    message(STATUS "Effective CUDA architectures: ${FASTLLM_CUDA_ARCHITECTURES}")
     add_compile_definitions(USE_CUDA)
     if (CUDA_NO_TENSOR_CORE)
         add_compile_definitions(CUDA_NO_TENSOR_CORE)
@@ -258,8 +292,38 @@ if (USE_CUDA)
         add_compile_definitions(CUDA_MEM_DEBUG)
     endif()
     include_directories(include/devices/cuda)
+    set(FASTLLM_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
+    set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED OFF)
+    set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
+    set(FASTLLM_CUTLASS_FP8_SM121_ENABLED OFF)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if (FASTLLM_CUDA_ARCH STREQUAL "120f" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
+            set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+        endif()
+        if (FASTLLM_CUDA_ARCH STREQUAL "120f")
+            set(FASTLLM_CUTLASS_FP8_SM120_ENABLED ON)
+        elseif (FASTLLM_CUDA_ARCH STREQUAL "121f")
+            set(FASTLLM_CUTLASS_FP8_SM121_ENABLED ON)
+        endif()
+    endforeach()
+    if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        FASTLLM_CUTLASS_FP8_ARCH_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        message(STATUS "CUTLASS FP8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
+        include_directories("${FASTLLM_CUTLASS_DIR}/include")
+        if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
+            include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
+        endif()
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_FP8)
+        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED)
+            add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+        endif()
+        if (FASTLLM_CUTLASS_FP8_SM121_ENABLED)
+            add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
+        endif()
+    else()
+        message(STATUS "CUTLASS FP8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
+    endif()
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-    
     set(FASTLLM_CUDA_SOURCES
         src/devices/cuda/cudadevice.cpp
         src/devices/cuda/cudadevicebatch.cpp
@@ -280,23 +344,77 @@ if (USE_CUDA)
 
     # 其他 CUDA 文件
     list(APPEND FASTLLM_CUDA_SOURCES
+        src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/attention/fastllm-attention.cu
+        src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
+        src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
+        src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
-    )
+        src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
+    # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
+
+    # SM70 (V100) AWQ W4A16: 移植的 TurboMind s884 内核子集 + fastllm 对接层。
+    # 仅在编译目标包含 sm_70 时编译；其它算力下这些 .cu 编译为占位实现（运行期不调度）。
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/turbomind)
+    set(TURBOMIND_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/turbomind/src/turbomind)
+    set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
+        src/devices/cuda/awq_sm70/fastllm-awq-sm70.cu
+        src/devices/cuda/awq_sm70/tm_registry_sm70.cu
+        ${TURBOMIND_ROOT}/core/check.cc
+        ${TURBOMIND_ROOT}/core/layout.cc
+        ${TURBOMIND_ROOT}/core/context.cc
+        ${TURBOMIND_ROOT}/core/allocator.cc
+        ${TURBOMIND_ROOT}/core/buffer.cc
+        ${TURBOMIND_ROOT}/core/stream.cc
+        ${TURBOMIND_ROOT}/utils/logger.cc
+        ${TURBOMIND_ROOT}/utils/parser.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/gemm.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/dispatch_cache.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/context.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/convert_v3.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/cast.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/unpack.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/cache_utils.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/measurer.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/sampler.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/stopping_criterion.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/params.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel/sm70_884_4.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel/sm70_884_8.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel/sm70_884_16.cu)
+
+    # TurboMind 的 .cc 为主机代码但依赖 CUDA 头文件，强制用 nvcc 编译以获得 CUDA include/链接。
+    set_source_files_properties(
+        ${TURBOMIND_ROOT}/core/check.cc
+        ${TURBOMIND_ROOT}/core/layout.cc
+        ${TURBOMIND_ROOT}/core/context.cc
+        ${TURBOMIND_ROOT}/core/allocator.cc
+        ${TURBOMIND_ROOT}/core/buffer.cc
+        ${TURBOMIND_ROOT}/core/stream.cc
+        ${TURBOMIND_ROOT}/utils/logger.cc
+        ${TURBOMIND_ROOT}/utils/parser.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/stopping_criterion.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/params.cc
+        PROPERTIES LANGUAGE CUDA)
 
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
 
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas nccl)
-    set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
+    add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas nccl cuda)
+    set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
 if(USE_ROCM)
@@ -366,13 +484,6 @@ if (USE_TFACC)
     add_compile_definitions(USE_TFACC)
     set(FASTLLM_TFACC_SOURCES src/devices/tfacc/tfaccdevice.cpp src/devices/tfacc/fastllm-tfacc.cpp)
     include_directories(include/devices/tfacc)
-endif()
-
-if (USE_NUMA)
-    add_compile_definitions(USE_NUMA)
-    set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES} src/devices/numa/numadevice.cpp src/devices/numa/fastllm-numa.cpp src/devices/numa/computeserver.cpp src/devices/numa/kvcache.cpp)
-    include_directories(include/devices/numa)
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
 endif()
 
 if (USE_NUMAS)
@@ -468,7 +579,6 @@ target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")
-set(BUILD_INFO_USE_NUMA "false")
 set(BUILD_INFO_USE_NUMAS "false")
 set(BUILD_INFO_USE_TFACC "false")
 set(BUILD_INFO_USE_TOPS "false")
@@ -478,9 +588,6 @@ if (USE_CUDA)
 endif()
 if (USE_ROCM)
     set(BUILD_INFO_USE_ROCM "true")
-endif()
-if (USE_NUMA)
-    set(BUILD_INFO_USE_NUMA "true")
 endif()
 if (USE_NUMAS)
     set(BUILD_INFO_USE_NUMAS "true")
@@ -495,7 +602,7 @@ if (USE_IVCOREX)
     set(BUILD_INFO_USE_IVCOREX "true")
 endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
-"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMA\": ${BUILD_INFO_USE_NUMA},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
+"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
 
 if (${CMAKE_HOST_WIN32})
     add_custom_command(

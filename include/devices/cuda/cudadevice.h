@@ -24,7 +24,12 @@ namespace fastllm {
     void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu);
+        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1);
+    void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
+        Data &gate, Data &up, Data &down, Data &w1,
+        MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f);
+    void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+    bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
     
     class CudaDevice : BaseDevice {
@@ -133,6 +138,12 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaSwigluLinearAddOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaLinearSwigluOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
@@ -145,6 +156,50 @@ namespace fastllm {
     };
 
     class CudaRepeatOp : CpuRepeatOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaCopyOp : CpuCopyOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4HcPreOp : CpuDeepSeekV4HcPreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4HcPostOp : CpuDeepSeekV4HcPostOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaScaleQRatoryOp : CpuScaleQRatoryOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4RotaryQuantOp : CpuDeepSeekV4RotaryQuantOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4WoAOp : CpuDeepSeekV4WoAOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4BuildCompressedKVFromRawOp : CpuDeepSeekV4BuildCompressedKVFromRawOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4StoreWindowKVCacheOp : CpuDeepSeekV4StoreWindowKVCacheOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV4UpdateWindowKVCacheOp : CpuDeepSeekV4UpdateWindowKVCacheOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -298,12 +353,25 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaLlama3RopeEncodingOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaQwen35InterleavedRopeOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaQKVRMSNormRopeOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
     // 融合 QKVRMSNormRope + Split KV + AppendPagedCacheBatch
     class CudaQKVRMSNormRopeSplitAppendPagedCacheOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 融合 Qwen3.5 QGate/K/V RMSNorm/Rope/Split + AppendPagedCacheBatch
+    class CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -320,6 +388,11 @@ namespace fastllm {
     };
 
     class CudaMergeMOE : CpuMergeMOE {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaFusedMOE : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

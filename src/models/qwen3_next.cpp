@@ -141,8 +141,8 @@ namespace fastllm {
                 );
 
                 if (j != -1) {
-                    this->specialWeights[swigluWeightName] = "linearSwiglu";
-                    this->specialWeights[downWeightName] = "linearColumn";
+                    this->AddSpecialWeight(swigluWeightName, "linearSwiglu", i);
+                    this->AddSpecialWeight(downWeightName, "linearColumn", i);
                 }
                 
                 if (j != -1) {
@@ -187,6 +187,24 @@ namespace fastllm {
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
+    }
+
+    static DataType Qwen3NextLinearAttentionCacheDataType(DataType modelType) {
+        if (modelType == DataType::FLOAT32 ||
+            modelType == DataType::FLOAT16 ||
+            modelType == DataType::BFLOAT16) {
+            return modelType;
+        }
+        return DataType::FLOAT16;
+    }
+
+    static void Qwen3NextPrepareLinearAttentionCache(Data &cache, DataType cacheType) {
+        cache.isKVCache = true;
+        cache.isLinearAttention = true;
+        if (cache.dims.empty() && cache.dataType != cacheType) {
+            cache.dataType = cacheType;
+            cache.UpdateUnitSize();
+        }
     }
 
     void Add1(Data &input) {
@@ -365,7 +383,9 @@ namespace fastllm {
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
             } else {
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-                pastKey.isLinearAttention = pastValue.isLinearAttention = true;
+                DataType linearCacheType = Qwen3NextLinearAttentionCacheDataType(this->dataType);
+                Qwen3NextPrepareLinearAttentionCache(pastKey, linearCacheType);
+                Qwen3NextPrepareLinearAttentionCache(pastValue, linearCacheType);
                 std::string qkvzWeightName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string qkvzBiasName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.bias";
                 std::string baWeightName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
@@ -698,7 +718,7 @@ namespace fastllm {
                 Data expertIndex, expertScore;
                 SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
                             this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
-                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(i);
                 MergeMOE (
                         attenInput, expertIndex, expertScore,
                         weights[i], biass[i],
@@ -1105,7 +1125,7 @@ namespace fastllm {
                     SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
                                 this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
                 }
-                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(i);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
                     && CanRunMergeMOE(attenInput, biass[i])) {
                     MergeMOE (
@@ -1358,4 +1378,4 @@ namespace fastllm {
         printf("finish.\n");
     }
 }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+

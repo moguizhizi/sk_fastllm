@@ -1454,6 +1454,33 @@ static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q2_K * x = (const block_q2_K *) vx;
+
+    const int64_t i = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float d = __low2float(x[i].dm);
+    const float dmin = __high2float(x[i].dm);
+    dst_t * y = yy + i * QK_K;
+
+    for (int idx = tid; idx < QK_K; idx += blockDim.x) {
+        const int ib128 = idx / 128;
+        const int i128 = idx - ib128 * 128;
+        const int scale_idx = ib128 * 8 + i128 / 16;
+        const int shift = 2 * (i128 / 32);
+        const int qidx = ib128 * 32 + (i128 & 15) + ((i128 & 31) >= 16 ? 16 : 0);
+
+        const uint8_t sc = x[i].scales[scale_idx];
+        const float dl = d * (sc & 0xF);
+        const float ml = dmin * (sc >> 4);
+        const int q = (x[i].qs[qidx] >> shift) & 0x3;
+
+        y[idx] = DequantizeCast<dst_t>::cast(dl * q - ml);
+    }
+}
+
+template<typename dst_t>
 static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
@@ -1545,6 +1572,13 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
+static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb = k / QK_K;
+    dequantize_block_q2_K<<<nb, 128, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
     const int64_t k = nrows * n_per_row;
     const int nb = k / QK_K;
@@ -1616,6 +1650,58 @@ static void dequantize_row_q4_K_r4_cuda(const void * vx, dst_t * y, const int64_
     // nrows must be a multiple of 4
     const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
     dequantize_block_q4_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
+}
+
+// Dequantize q2_K_r4 (4-row interleaved) format back to float/half/bf16.
+// Each block_q2_k_r4 encodes 4 rows x QK_K elements.
+template<typename dst_t>
+static __global__ void dequantize_block_q2_K_r4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 const int64_t n_per_row) {
+    const block_q2_k_r4 * x = (const block_q2_k_r4 *) vx;
+    const int64_t i = blockIdx.x;
+
+    const int64_t tid  = threadIdx.x;
+    const int64_t k    = tid / 32;     // row 0..3
+    const int64_t ltid = tid % 32;     // 0..31
+
+    const int nblock = n_per_row / QK_K;
+    const int64_t group = i / nblock;
+    const int64_t ibl   = i % nblock;
+    dst_t * y = yy + group * 4 * n_per_row + k * n_per_row + ibl * QK_K;
+
+    const float d = __half2float(x[i].d[k]);
+    const float dmin = __half2float(x[i].d[k + 4]);
+
+    // ltid = 0..31 -> ib = 0..7, j = 0..3. Each ib covers 32 values:
+    // the first 16 and last 16 values use separate scale/min nibbles.
+    const int ib = ltid / 4;
+    const int j  = ltid % 4;
+
+    const uint8_t sc0 = x[i].scales[8 * ib + k + 0];
+    const uint8_t sc1 = x[i].scales[8 * ib + k + 4];
+    const float d0 = d * (sc0 & 0xF);
+    const float m0 = dmin * (sc0 >> 4);
+    const float d1 = d * (sc1 & 0xF);
+    const float m1 = dmin * (sc1 >> 4);
+
+    const uint8_t * qs_base = x[i].qs + 32 * ib + 4 * k;
+    const uint8_t q0 = qs_base[j + 0];
+    const uint8_t q1 = qs_base[j + 16];
+
+    y[32 * ib + j +  0] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 0) & 0x3) - m0);
+    y[32 * ib + j +  4] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 2) & 0x3) - m0);
+    y[32 * ib + j +  8] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 4) & 0x3) - m0);
+    y[32 * ib + j + 12] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 6) & 0x3) - m0);
+    y[32 * ib + j + 16] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 0) & 0x3) - m1);
+    y[32 * ib + j + 20] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 2) & 0x3) - m1);
+    y[32 * ib + j + 24] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 4) & 0x3) - m1);
+    y[32 * ib + j + 28] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 6) & 0x3) - m1);
+}
+
+template<typename dst_t>
+static void dequantize_row_q2_K_r4_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
+    dequantize_block_q2_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
 
 template<typename dst_t>
@@ -1809,14 +1895,16 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
                // return dequantize_block_q8_0_f16_cuda;
             //}
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
-        // case GGML_TYPE_Q2_K:
-        //    return dequantize_row_q2_K_cuda;
+        case GGML_TYPE_Q2_K:
+            return dequantize_row_q2_K_cuda;
         //case GGML_TYPE_Q3_K:
         //    return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
         case GGML_TYPE_Q4_K_R4:
             return dequantize_row_q4_K_r4_cuda;
+        case GGML_TYPE_Q2_K_R4:
+            return dequantize_row_q2_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:
@@ -1898,10 +1986,14 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q8_0:
             return dequantize_block_q8_0_bf16_cuda;
+        case GGML_TYPE_Q2_K:
+            return dequantize_row_q2_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
         case GGML_TYPE_Q4_K_R4:
             return dequantize_row_q4_K_r4_cuda;
+        case GGML_TYPE_Q2_K_R4:
+            return dequantize_row_q2_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:
@@ -1962,8 +2054,17 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
         }
 
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        half *cudaFp16Weight;
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        // GGML 的 dequant 是 type-specific 的整行回调，不容易按行 chunk；
+        // 只在 workspace 一次能装下整张权重时借用，否则回退到老路径。
+        size_t needBytes = (size_t)k * m * sizeof(half);
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
+        if (!ownScratch && wsBytes < needBytes) {
+            cudaFp16Weight = (half *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1994,7 +2095,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
-        FastllmCudaFree(cudaFp16Weight);
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else if (n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
@@ -2077,8 +2178,14 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        half *cudaFp16Weight;
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+        size_t needBytes = (size_t)k * m * sizeof(half);
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
+        if (!ownScratch && wsBytes < needBytes) {
+            cudaFp16Weight = (half *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -2102,7 +2209,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
             exit(0);
         }
 
-        FastllmCudaFree(cudaFp16Weight);
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else if (n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
@@ -2184,7 +2291,14 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        __nv_bfloat16 *cudaBf16Weight = (__nv_bfloat16 *)FastllmCudaMalloc(k * m * sizeof(__nv_bfloat16));
+        size_t needBytes = (size_t)k * m * sizeof(__nv_bfloat16);
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        __nv_bfloat16 *cudaBf16Weight = (__nv_bfloat16 *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
+        if (!ownScratch && wsBytes < needBytes) {
+            cudaBf16Weight = (__nv_bfloat16 *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
         dequant((const char *)weight.cudaData, cudaBf16Weight, k, m, nullptr);
 
         float h_alpha = 1.0f, h_beta = 0.0f;
@@ -2205,7 +2319,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
             exit(0);
         }
 
-        FastllmCudaFree(cudaBf16Weight);
+        FastllmReleaseDequantScratch(cudaBf16Weight, ownScratch);
     } else if (n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
@@ -2249,4 +2363,198 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     FastllmCudaFinishOutput(output, cudaOutput);
 
     return true;
+}
+
+template <typename T>
+struct FastllmMoeGGUFTraits;
+
+template <>
+struct FastllmMoeGGUFTraits<half> {
+    static constexpr fastllm::DataType dataType = fastllm::DataType::FLOAT16;
+    __device__ __forceinline__ static float toFloat(half value) {
+        return __half2float(value);
+    }
+    __device__ __forceinline__ static half fromFloat(float value) {
+        return __float2half_rn(value);
+    }
+};
+
+template <>
+struct FastllmMoeGGUFTraits<__nv_bfloat16> {
+    static constexpr fastllm::DataType dataType = fastllm::DataType::BFLOAT16;
+    __device__ __forceinline__ static float toFloat(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 fromFloat(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct FastllmMoeGGUFTraits<float> {
+    static constexpr fastllm::DataType dataType = fastllm::DataType::FLOAT32;
+    __device__ __forceinline__ static float toFloat(float value) {
+        return value;
+    }
+    __device__ __forceinline__ static float fromFloat(float value) {
+        return value;
+    }
+};
+
+template <typename T>
+static __global__ void FastllmMoeGGUFReduceKernel(const T *partOutput, T *output, const float *scores,
+                                                  int topk, int hidden) {
+    int st = blockIdx.x * blockDim.x + threadIdx.x;
+    if (st >= hidden) {
+        return;
+    }
+
+    float value = 0.0f;
+    for (int j = 0; j < topk; j++) {
+        value += FastllmMoeGGUFTraits<T>::toFloat(partOutput[(size_t)j * hidden + st]) * scores[j];
+    }
+    output[st] = FastllmMoeGGUFTraits<T>::fromFloat(value);
+}
+
+static size_t FastllmMoeGGUFQ8Bytes(int rows, int cols) {
+    return (size_t)rows * (cols / QK8_1) * sizeof(block_q8_1);
+}
+
+template <typename T>
+static void FastllmMoeGGUFMatMulQ8(ggml_type type, const void *weight, const block_q8_1 *q8Input,
+                                   T *output, int m, int k) {
+    ggml_backend_cuda_context ctx;
+    ggml_cuda_op_mul_mat_vec_q_impl(
+        ctx, type, m, k, 1,
+        0, 0, 0, 0,
+        (const char*)weight, (const char*)q8Input, output, nullptr,
+        0, k, 1, m, nullptr
+    );
+}
+
+static bool FastllmMoeGGUFCanRunWeight(const fastllm::Data *weight, int m, int k) {
+    if (weight == nullptr || weight->dataType != fastllm::DataType::DATA_GGUF_FORMAT ||
+        weight->ggmlType < 0 || weight->cudaData == nullptr ||
+        weight->dims.size() != 2 || weight->dims[0] != k || weight->dims[1] != m) {
+        return false;
+    }
+    ggml_type type = (ggml_type)weight->ggmlType;
+    return get_has_vec_dot_q_cuda(type) && m % ggml_blck_size(type) == 0;
+}
+
+template <typename T>
+static bool FastllmCudaTypedMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                               fastllm::Data &output, fastllm::Data **gateups,
+                                               fastllm::Data **downs, const float *scores,
+                                               bool scoresOnCuda, int topk, int hidden, int inter) {
+    if (topk <= 0 || hidden <= 0 || inter <= 0 || scores == nullptr ||
+        gateups == nullptr || downs == nullptr ||
+        input.dataType != FastllmMoeGGUFTraits<T>::dataType ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        hidden % QK8_1 != 0 || inter % QK8_1 != 0) {
+        return false;
+    }
+
+    for (int j = 0; j < topk; j++) {
+        if (!FastllmMoeGGUFCanRunWeight(gateups[j], hidden, inter * 2) ||
+            !FastllmMoeGGUFCanRunWeight(downs[j], inter, hidden)) {
+            return false;
+        }
+    }
+
+    fastllm::Data gateOutput;
+    gateOutput.dataDevice = input.dataDevice;
+    gateOutput.dataDeviceIds = input.dataDeviceIds;
+    gateOutput.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    gateOutput.Resize({topk, inter * 2});
+    gateOutput.Allocate(false);
+
+    w1.dataDevice = input.dataDevice;
+    w1.dataDeviceIds = input.dataDeviceIds;
+    w1.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    w1.Resize({topk, inter});
+    w1.Allocate(false);
+
+    fastllm::Data downOutput;
+    downOutput.dataDevice = input.dataDevice;
+    downOutput.dataDeviceIds = input.dataDeviceIds;
+    downOutput.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    downOutput.Resize({topk, hidden});
+    downOutput.Allocate(false);
+
+    output.dataDevice = input.dataDevice;
+    output.dataDeviceIds = input.dataDeviceIds;
+    output.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    output.Resize({1, hidden});
+    output.Allocate(false);
+
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaGate = (T*)FastllmCudaPrepareOutput(gateOutput);
+    T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
+    T *cudaDown = (T*)FastllmCudaPrepareOutput(downOutput);
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+
+    block_q8_1 *q8Input = (block_q8_1*)FastllmCudaMalloc(FastllmMoeGGUFQ8Bytes(1, hidden));
+    quantize_row_q8_1_cuda(cudaInput, q8Input, hidden, 1, 1, hidden, GGML_TYPE_Q8_1, nullptr);
+
+    for (int j = 0; j < topk; j++) {
+        FastllmMoeGGUFMatMulQ8((ggml_type)gateups[j]->ggmlType, gateups[j]->cudaData, q8Input,
+                               cudaGate + (size_t)j * inter * 2, hidden, inter * 2);
+    }
+
+    FastllmCudaSwiglu(gateOutput, w1);
+
+    block_q8_1 *q8W1 = (block_q8_1*)FastllmCudaMalloc(FastllmMoeGGUFQ8Bytes(topk, inter));
+    quantize_row_q8_1_cuda(cudaW1, q8W1, inter, topk, 1, inter, GGML_TYPE_Q8_1, nullptr);
+    for (int j = 0; j < topk; j++) {
+        FastllmMoeGGUFMatMulQ8((ggml_type)downs[j]->ggmlType, downs[j]->cudaData,
+                               q8W1 + (size_t)j * (inter / QK8_1),
+                               cudaDown + (size_t)j * hidden, inter, hidden);
+    }
+
+    const float *cudaScores = scores;
+    float *ownedCudaScores = nullptr;
+    if (!scoresOnCuda) {
+        ownedCudaScores = (float*)FastllmCudaMalloc((size_t)topk * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(ownedCudaScores, (void*)scores, (size_t)topk * sizeof(float));
+        cudaScores = ownedCudaScores;
+    }
+
+    int threadPerBlock = 256;
+    FastllmMoeGGUFReduceKernel<T><<<(hidden - 1) / threadPerBlock + 1, threadPerBlock>>>(
+        cudaDown, cudaOutput, cudaScores, topk, hidden);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+
+    if (ownedCudaScores != nullptr) {
+        FastllmCudaFree(ownedCudaScores);
+    }
+    FastllmCudaFree(q8W1);
+    FastllmCudaFree(q8Input);
+    return true;
+}
+
+bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                        fastllm::Data &output, fastllm::Data **gateups,
+                                        fastllm::Data **downs, const float *scores,
+                                        bool scoresOnCuda, int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1<float>(
+        input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
+}
+
+bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                       fastllm::Data &output, fastllm::Data **gateups,
+                                       fastllm::Data **downs, const float *scores,
+                                       bool scoresOnCuda, int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1<half>(
+        input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
+}
+
+bool FastllmCudaBFloat16MergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                           fastllm::Data &output, fastllm::Data **gateups,
+                                           fastllm::Data **downs, const float *scores,
+                                           bool scoresOnCuda, int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1<__nv_bfloat16>(
+        input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
 }

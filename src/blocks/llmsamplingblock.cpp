@@ -1,13 +1,62 @@
 #include "baseblock.h"
 #include "models/basellm.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <string>
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
+    namespace {
+        static bool NeedRepeatPenalty(const GenerationConfig &config) {
+            float diff = config.repeat_penalty - 1.0f;
+            return diff > 1e-6f || diff < -1e-6f;
+        }
+    }
+
+    struct LogitsDebugOptions {
+        bool printLogits = false;
+        std::string dumpPath;
+    };
+
+    static bool IsLogitsEnvEnabled(const char *v) {
+        return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }
+
+    static const LogitsDebugOptions &GetLogitsDebugOptions() {
+        static const LogitsDebugOptions options = []() {
+            LogitsDebugOptions ret;
+            ret.printLogits = GetFastllmEnv().printLogits ||
+                              IsLogitsEnvEnabled(std::getenv("FASTLLM_PRINT_LOGITS"));
+            const char *path = std::getenv("FASTLLM_DSV4_DUMP_LOGITS");
+            if (path != nullptr) {
+                ret.dumpPath = path;
+            }
+            return ret;
+        }();
+        return options;
+    }
+
     static bool ShouldPrintLogits() {
-        return GetFastllmEnv().printLogits;
+        return GetLogitsDebugOptions().printLogits;
+    }
+
+    static const std::string &LogitsDumpPath() {
+        return GetLogitsDebugOptions().dumpPath;
+    }
+
+    static void DumpLogitsIfNeeded(Data &logits) {
+        bool needPrint = ShouldPrintLogits();
+        if (!needPrint) {
+            return;
+        }
+        logits.ToDevice(DataDevice::CPU);
+        float *p = (float*)logits.cpuData;
+        uint64_t count = logits.Count(0);
     }
 
     void LLMSamplingBlock (
@@ -47,7 +96,7 @@ namespace fastllm {
         Linear(*hiddenStates, *lmHeadWeight, *GetEmptyData(), logits);
         ToDataType(logits, DataType::FLOAT32);
 
-        bool allSimple = true, needLogits = false;
+        bool allSimple = true, needLogits = false, needRepeatPenalty = false;
         int maxTopK = 1;
         for (int b = 0; b < batch; b++) {
             if (!generationConfigs[b].IsSimpleGreedy()) {
@@ -57,10 +106,12 @@ namespace fastllm {
         }
         for (int b = 0; b < batch; b++) {
             needLogits |= generationConfigs[b].output_logits;
+            needRepeatPenalty |= NeedRepeatPenalty(generationConfigs[b]);
             maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
         }
 
         model->ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
+        DumpLogitsIfNeeded(logits);
         if (ShouldPrintLogits()) {
             printf("LLMSamplingBlock logits:\n");
             logits.Print();
@@ -76,24 +127,26 @@ namespace fastllm {
                 topkData += topk.Count(2);
             }
         } else if (!needLogits) {
-            int maxTokenSetSize = 0;
-            for (int b = 0; b < batch; b++) {
-                maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
-            }
-            std::vector<float> penaltyData(batch * maxTokenSetSize, -100.0f);
-            std::vector<float> penaltyScaleData(batch, 1.0f);
-            for (int b = 0; b < batch; b++) {
-                int curId = 0;
-                for (int i : lastTokens.units[b].tokenSet) {
-                    penaltyData[b * maxTokenSetSize + curId] = i;
-                    curId++;
+            if (needRepeatPenalty) {
+                int maxTokenSetSize = 0;
+                for (int b = 0; b < batch; b++) {
+                    maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
                 }
-                penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
+                std::vector<float> penaltyData(batch * maxTokenSetSize, -100.0f);
+                std::vector<float> penaltyScaleData(batch, 1.0f);
+                for (int b = 0; b < batch; b++) {
+                    int curId = 0;
+                    for (int i : lastTokens.units[b].tokenSet) {
+                        penaltyData[b * maxTokenSetSize + curId] = i;
+                        curId++;
+                    }
+                    penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
+                }
+                Data penalty, penaltyScale;
+                penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
+                penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
+                RepeatPenalty(logits, penalty, penaltyScale);
             }
-            Data penalty, penaltyScale;
-            penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
-            penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
-            RepeatPenalty(logits, penalty, penaltyScale);
 #ifdef USE_CUDA
             if (logits.dataDevice == DataDevice::CUDA) {
                 int vocabSize = logits.dims.back();

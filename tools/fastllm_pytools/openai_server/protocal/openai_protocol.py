@@ -79,11 +79,7 @@ class ChatCompletionNamedToolChoiceParam(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: Optional[Union[
-        str,
-        List[Dict[str, str]],
-        List[Dict[str, Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]]],
-    ]] = []
+    messages: Optional[Union[str, List[Dict[str, Any]]]] = []
     prompt: Optional[str] = ""
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -119,6 +115,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[list[ToolCall]] = None
 
 
@@ -169,7 +166,7 @@ class ExtractedToolCallInformation(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    finish_reason: Optional[Literal["stop", "length"]] = None
+    finish_reason: Optional[Literal["stop", "length", "tool_calls"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):

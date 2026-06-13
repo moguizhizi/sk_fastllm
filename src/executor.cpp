@@ -7,6 +7,7 @@
 #include "executor.h"
 
 #include "devices/cpu/cpudevice.h"
+#include "devices/disk/diskdevice.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -27,15 +28,32 @@
 #include "devices/tops/topsdevice.h"
 #endif
 
-#ifdef USE_NUMA
-#include "devices/numa/numadevice.h"
-#endif
-
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #endif
 
 namespace fastllm {
+#ifdef USE_CUDA
+    static void SyncCudaDeviceForProfiler(BaseDevice *device) {
+        if (!GetFastllmEnv().cudaSync || device == nullptr) {
+            return;
+        }
+        if (device->deviceType == "cuda") {
+            ForceDeviceSync();
+        } else if (device->deviceType == "multicuda") {
+            if (device->deviceIds.empty()) {
+                ForceDeviceSync();
+                return;
+            }
+            for (int deviceId : device->deviceIds) {
+                if (deviceId >= 0) {
+                    FastllmCudaSyncDevice(deviceId);
+                }
+            }
+        }
+    }
+#endif
+
     Executor::Executor() {
         this->devices.clear();
 #ifdef USE_CUDA
@@ -50,19 +68,10 @@ namespace fastllm {
 #ifdef USE_TFACC
         this->devices.push_back((BaseDevice*) new TfaccDevice());
 #endif
-#ifdef USE_NUMA
-        try {
-            if (GetFastllmEnv().activateNuma) {
-                printf("ACTIVATE NUMA = ON\n");
-                this->devices.push_back((BaseDevice*) new NumaDevice());
-            }
-        } catch (...) {
-        }
-#endif
-
 #ifdef USE_NUMAS
         this->devices.push_back((BaseDevice*) new NumasDevice());
 #endif
+        this->devices.push_back((BaseDevice*) new DiskDevice());
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }
 
@@ -128,6 +137,14 @@ namespace fastllm {
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
+        {
+            auto positionIt = datas.find("positionIds");
+            if (positionIt != datas.end() && positionIt->second != nullptr &&
+                positionIt->second->dataType != DataType::FLOAT32 &&
+                intParams.find("positionIds___batch") == intParams.end()) {
+                this->Run("ToFloat32", {{"input", positionIt->second}}, {}, {});
+            }
+        }
         bool lockInCPU = false;
         if (GetKVCacheInCPU() || GetHistoryCacheInCPU()) {
             // 暂时只有kvcache可能lock在CPU上
@@ -155,9 +172,7 @@ namespace fastllm {
                 }
                 if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
                     FastllmMultiCudaSetDevice(device->deviceIds);
-                    if (device->deviceIdsRatio.size() > 0) {
-                        FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
-                    }
+                    FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
                 }
 #endif
                 bool intParamsSize = intParams.size();
@@ -165,7 +180,7 @@ namespace fastllm {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
                         if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
-                            if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc") && 
+                            if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") && 
                                 ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
                                 continue;
                             }
@@ -195,6 +210,9 @@ namespace fastllm {
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
+#ifdef USE_CUDA
+                SyncCudaDeviceForProfiler(device);
+#endif
                 run = true;
                 break;
             }
@@ -206,8 +224,91 @@ namespace fastllm {
         profiler[opType] += spend;
     }
 
+    void Executor::RunOnDevice(const std::string &deviceType,
+                               const std::string &opType,
+                               const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams,
+                               const fastllm::IntDict &intParams) {
+        auto st = std::chrono::system_clock::now();
+        bool run = false;
+        for (auto device: devices) {
+            if (device->deviceType != deviceType) {
+                continue;
+            }
+            if (!device->CanRun(opType, datas, floatParams, intParams)) {
+                continue;
+            }
+#ifdef USE_CUDA
+            if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
+                FastllmCudaSetDevice(device->deviceIds[0]);
+            }
+            if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
+                FastllmMultiCudaSetDevice(device->deviceIds);
+                FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
+            }
+#endif
+            bool intParamsSize = intParams.size();
+            for (auto &it: datas) {
+                if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
+                    int batch = intParams.find(it.first + "___batch")->second;
+                    if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
+                        if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") &&
+                            ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
+                            continue;
+                        }
+                        if ((device->deviceType == "cuda" || device->deviceType == "multicuda") && ((Data**)it.second)[2]->dataDevice == DataDevice::CUDA) {
+                            continue;
+                        }
+                    }
+                    if ((it.first == "biass") && !((Data**)it.second)[2]) {
+                        continue;
+                    }
+                    for (int i = 0; i < batch; i++) {
+                        if (((Data**)it.second)[i]) {
+                            ((Data**)it.second)[i]->ToDevice((void *) device);
+                        }
+                    }
+                } else {
+                    if (it.second) {
+                        bool copyData = true;
+                        if (it.first == "output") {
+                            copyData = false;
+                        } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
+                            copyData = false;
+                        }
+                        it.second->ToDevice((void *) device, copyData);
+                    }
+                }
+            }
+            device->Reshape(opType, datas, floatParams, intParams);
+            device->Run(opType, datas, floatParams, intParams);
+#ifdef USE_CUDA
+            SyncCudaDeviceForProfiler(device);
+#endif
+            run = true;
+            break;
+        }
+        if (!run) {
+            ErrorInFastLLM("Can't run " + opType + " on device " + deviceType + ".");
+        }
+        float spend = GetSpan(st, std::chrono::system_clock::now());
+        profiler[opType] += spend;
+    }
+
     void Executor::ClearProfiler() {
         profiler.clear();
+    }
+
+    void Executor::AddProfiler(const std::string &opType, float spend) {
+        profiler[opType] += spend;
+    }
+
+    float Executor::GetProfilerTotal() const {
+        float sum = 0.0f;
+        for (auto &it : profiler) {
+            sum += it.second;
+        }
+        return sum;
     }
 
     void Executor::PrintProfiler() {

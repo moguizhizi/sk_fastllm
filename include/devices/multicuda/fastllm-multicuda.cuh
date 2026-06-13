@@ -21,14 +21,23 @@ void FastllmCudaSyncDevice(int deviceId);
 
 std::vector <int> FastllmMultiCudaGetSplitPoints(std::vector <int> &multiCudaCurrentDevices, std::map <int, int> &multiCudaCurrentRatios, int total, int unit);
 void FastllmGetMulticudaDeviceAndRatio(std::vector <int> &devices, std::map <int, int> &ratios, bool noSpecial);
+void BalanceMultiCudaDivisionSchemeByLayer(const std::string &weightName,
+    const std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme,
+    bool explicitDeviceRatios = false);
+void BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(const std::string &weightName,
+    const std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme,
+    int mid, bool explicitDeviceRatios = false);
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
-    std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis);
+    std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
+    bool explicitDeviceRatios = false);
 bool SplitMultiCudaWeight1D(fastllm::Data &bias, std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme); // 1维的多卡切分
+bool PlaceMultiCudaWeightOnDevice(fastllm::Data &weight, std::vector <int> &multiCudaCurrentDevices, int targetDevice);
 void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData);
 void PrepareMultiCudaReplicatedData(fastllm::Data &data, std::vector <int> devices, bool copyData);
 void PrepareMultiCudaShardedData(fastllm::Data &data, std::vector <int> devices,
     const std::vector <int> &globalDims, int axis, DivisionScheme divisionScheme);
 DivisionScheme BuildMultiCudaRowSplitScheme(fastllm::Data &weight, std::vector <int> &devices, std::map <int, int> &ratios);
+DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vector <int> &devices, std::map <int, int> &ratios);
 
 void FastllmMultiCudaSetDevice(std::vector <int> ids);
 void FastllmMultiCudaSetDeviceRatio(std::map <int, int> &deviceRatio);
