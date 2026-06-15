@@ -115,7 +115,6 @@ class FastLLmCompletion:
     self.hide_input = hide_input
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
-    self.tool_parser = None
     
   def init_fast_llm_model(self):
     pass
@@ -137,6 +136,88 @@ class FastLLmCompletion:
           top_k = 1
           top_p = 1.0
       return do_sample, top_p, top_k, temperature
+
+  def _normalize_stop_strings(
+      self, stop: Optional[Union[str, List[str]]]
+  ) -> List[str]:
+      if stop is None:
+          return []
+      if isinstance(stop, str):
+          stops = [stop]
+      else:
+          stops = stop
+      return [item for item in stops if isinstance(item, str) and item != ""]
+
+  def _stop_token_ids_from_strings(self, stop_strings: List[str]) -> Optional[List[int]]:
+      stop_token_ids: List[int] = []
+      for stop in stop_strings:
+          try:
+              token_ids = self.model.encode(stop)
+          except Exception:
+              token_ids = []
+          if len(token_ids) == 1 and token_ids[0] not in stop_token_ids:
+              stop_token_ids.append(token_ids[0])
+      return stop_token_ids or None
+
+  def _truncate_at_stop(
+      self, text: str, stop_strings: List[str]
+  ) -> Tuple[str, bool]:
+      if not stop_strings:
+          return text, False
+      stop_pos = -1
+      for stop in stop_strings:
+          pos = text.find(stop)
+          if pos >= 0 and (stop_pos < 0 or pos < stop_pos):
+              stop_pos = pos
+      if stop_pos < 0:
+          return text, False
+      return text[:stop_pos], True
+
+  def _filter_stop_delta(
+      self,
+      delta_text: str,
+      stop_strings: List[str],
+      state: Dict[str, Any],
+  ) -> Tuple[str, bool]:
+      if not stop_strings:
+          return delta_text, False
+
+      buffer = state.get("buffer", "") + delta_text
+      stop_pos = -1
+      for stop in stop_strings:
+          pos = buffer.find(stop)
+          if pos >= 0 and (stop_pos < 0 or pos < stop_pos):
+              stop_pos = pos
+      if stop_pos >= 0:
+          state["buffer"] = ""
+          return buffer[:stop_pos], True
+
+      keep_len = max(len(stop) for stop in stop_strings) - 1
+      if keep_len <= 0:
+          state["buffer"] = ""
+          return buffer, False
+
+      emit_len = max(0, len(buffer) - keep_len)
+      state["buffer"] = buffer[emit_len:]
+      return buffer[:emit_len], False
+
+  def _flush_stop_buffer(self, stop_strings: List[str], state: Dict[str, Any]) -> str:
+      if not stop_strings:
+          return ""
+      buffer = state.get("buffer", "")
+      state["buffer"] = ""
+      return buffer
+
+  def _chat_finish_reason(
+      self,
+      completion_tokens: int,
+      max_length: Optional[int],
+      stopped_by_stop_string: bool = False,
+  ) -> str:
+      if (not stopped_by_stop_string and max_length is not None
+              and completion_tokens >= max_length):
+          return "length"
+      return "stop"
 
   def _is_deepseek_v4_model(self) -> bool:
       try:
@@ -682,28 +763,27 @@ class FastLLmCompletion:
           tool_choice = "auto",
       )
 
-  def _ensure_tool_parser(self):
-      if self.tool_parser is None:
-          tokenizer = getattr(self.model, "hf_tokenizer", None)
-          model_type = self.model.get_type()
-          chat_template = getattr(tokenizer, "chat_template", None)
-          force_type = getattr(self.model, "tool_call_parser", "auto")
-          allow_without_chat_template = (
-              model_type == "deepseek_v4" or
-              force_type in ("deepseek_v4",)
+  def _create_tool_parser(self):
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
+      model_type = self.model.get_type()
+      chat_template = getattr(tokenizer, "chat_template", None)
+      force_type = getattr(self.model, "tool_call_parser", "auto")
+      allow_without_chat_template = (
+          model_type == "deepseek_v4" or
+          force_type in ("deepseek_v4",)
+      )
+      if tokenizer is None and allow_without_chat_template:
+          tokenizer = _EmptyToolTokenizer()
+      if tokenizer is None or (chat_template is None and not allow_without_chat_template):
+          raise ValueError(
+              "Tool calling requires a Hugging Face tokenizer with chat_template. "
+              "Please use an HF model directory or provide the original tokenizer files."
           )
-          if tokenizer is None and allow_without_chat_template:
-              tokenizer = _EmptyToolTokenizer()
-          if tokenizer is None or (chat_template is None and not allow_without_chat_template):
-              raise ValueError(
-                  "Tool calling requires a Hugging Face tokenizer with chat_template. "
-                  "Please use an HF model directory or provide the original tokenizer files."
-              )
-          from .tool_parsers import ToolParserManager
-          self.tool_parser = ToolParserManager.get_tool_parser_auto(
-              model_type, chat_template,
-              force_chat_template = self.model.force_chat_template,
-              force_type = force_type)(tokenizer)
+      from .tool_parsers import ToolParserManager
+      return ToolParserManager.get_tool_parser_auto(
+          model_type, chat_template,
+          force_chat_template = self.model.force_chat_template,
+          force_type = force_type)(tokenizer)
 
   def _parse_anthropic_message_content(
       self,
@@ -1023,6 +1103,8 @@ class FastLLmCompletion:
 
       max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
+      stop_strings = self._normalize_stop_strings(request.stop)
+      stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
       enable_thinking = self.enable_thinking
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
@@ -1051,7 +1133,7 @@ class FastLLmCompletion:
                             top_p = top_p, top_k = top_k, temperature = temperature,
                             repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
                             enable_thinking = enable_thinking, images = model_images,
-                            videos = model_videos)
+                            videos = model_videos, stop_token_ids = stop_token_ids)
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
@@ -1113,12 +1195,12 @@ class FastLLmCompletion:
 
       result, reasoning_content = self._split_deepseek_v4_reasoning(
           result, emit_reasoning_content)
+      result, stopped_by_stop_string = self._truncate_at_stop(
+          result, self._normalize_stop_strings(request.stop))
 
       if request.tools:
-          self._ensure_tool_parser()
-
-      if request.tools:
-          tool_call_info = self.tool_parser.extract_tool_calls(result, request)
+          tool_parser = self._create_tool_parser()
+          tool_call_info = tool_parser.extract_tool_calls(result, request)
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called=False, tool_calls=[], content=result)
@@ -1144,7 +1226,9 @@ class FastLLmCompletion:
                   reasoning_content=reasoning_content or None,
               ),
               logprobs=None,
-              finish_reason='stop',
+              finish_reason=self._chat_finish_reason(
+                  completion_tokens, request.max_tokens or 32768,
+                  stopped_by_stop_string),
           )
 
       response = ChatCompletionResponse(
@@ -1176,6 +1260,9 @@ class FastLLmCompletion:
       chunk_object_type = "chat.completion.chunk"
       json_dump = lambda obj: json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
       fast_text_stream = not request.tools and not emit_reasoning_content
+      stop_strings = self._normalize_stop_strings(request.stop)
+      stop_filter_state = {"buffer": ""}
+      stopped_by_stop_string = False
 
       # TODO: 支持request.n 和 request.echo配置
       first_iteration = True
@@ -1233,8 +1320,7 @@ class FastLLmCompletion:
 
         # 2. content部分
 
-        if request.tools:
-            self._ensure_tool_parser()
+        tool_parser = self._create_tool_parser() if request.tools else None
         
         completion_tokens = 0
 
@@ -1271,18 +1357,27 @@ class FastLLmCompletion:
                 yield f"data: {data}\n\n"
             if delta_text == "":
                 continue
+            if not request.tools:
+                delta_text, stop_hit = self._filter_stop_delta(
+                    delta_text, stop_strings, stop_filter_state)
+                if stop_hit:
+                    stopped_by_stop_string = True
+                if delta_text == "":
+                    if stopped_by_stop_string:
+                        break
+                    continue
 
             # print("delta_text", delta_text)
 
             # Send token-by-token response for each request.n
-            if self.tool_parser and request.tools: 
-                now_ids = self.tool_parser.get_token_ids(delta_text)
+            if tool_parser and request.tools:
+                now_ids = tool_parser.get_token_ids(delta_text)
                 # print("delta_text", delta_text, "now_ids", now_ids)
 
                 current_text += delta_text
                 current_token_ids += now_ids
 
-                delta_message = self.tool_parser.extract_tool_calls_streaming(
+                delta_message = tool_parser.extract_tool_calls_streaming(
                                 previous_text = previous_text,
                                 current_text = current_text,
                                 delta_text = delta_text,
@@ -1326,7 +1421,40 @@ class FastLLmCompletion:
                         model = model_name)
                     data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
+            if stopped_by_stop_string:
+                break
             #await asyncio.sleep(0)
+
+        if (not request.tools) and not stopped_by_stop_string:
+            delta_text = self._flush_stop_buffer(stop_strings, stop_filter_state)
+            if delta_text:
+                if fast_text_stream:
+                    data = json_dump({
+                        "id": request_id,
+                        "object": chunk_object_type,
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": delta_text},
+                            "logprobs": None,
+                            "finish_reason": None,
+                        }],
+                    })
+                else:
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index = 0,
+                        delta = DeltaMessage(content = delta_text),
+                        logprobs = None,
+                        finish_reason = None)
+                    chunk = ChatCompletionStreamResponseWithUsage(
+                        id = request_id,
+                        object = chunk_object_type,
+                        created = created_time,
+                        choices = [choice_data],
+                        model = model_name)
+                    data = chunk.model_dump_json(exclude_unset=True)
+                yield f"data: {data}\n\n"
 
         if (emit_reasoning_content and reasoning_state.get("active")
                 and reasoning_state.get("buffer")):
@@ -1346,8 +1474,10 @@ class FastLLmCompletion:
             reasoning_state["buffer"] = ""
 
         # 3. 结束标志
-        finish_reason = 'stop'
-        if request.tools and self.tool_parser and getattr(self.tool_parser, "prev_tool_call_arr", None):
+        finish_reason = self._chat_finish_reason(
+            completion_tokens, request.max_tokens or 32768,
+            stopped_by_stop_string)
+        if request.tools and tool_parser and getattr(tool_parser, "prev_tool_call_arr", None):
             finish_reason = 'tool_calls'
         if fast_text_stream:
             data = json_dump({
@@ -1421,8 +1551,8 @@ class FastLLmCompletion:
            return self.create_error_response("Client disconnected")
 
       if request.tools and parser_request is not None:
-          self._ensure_tool_parser()
-          tool_call_info = self.tool_parser.extract_tool_calls(result, parser_request)
+          tool_parser = self._create_tool_parser()
+          tool_call_info = tool_parser.extract_tool_calls(result, parser_request)
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called = False, tool_calls = [], content = result)
@@ -1475,8 +1605,11 @@ class FastLLmCompletion:
           yield self._create_anthropic_sse_event(
               "message_start", MessageStartEvent(message = message))
 
-          if request.tools and parser_request is not None:
-              self._ensure_tool_parser()
+          tool_parser = (
+              self._create_tool_parser()
+              if request.tools and parser_request is not None
+              else None
+          )
 
           async for res in result_generator:
               if (res == "[unused16]"):
@@ -1486,12 +1619,12 @@ class FastLLmCompletion:
               completion_tokens += 1
               delta_text = res
 
-              if request.tools and parser_request is not None and self.tool_parser:
-                  now_ids = self.tool_parser.get_token_ids(delta_text)
+              if request.tools and parser_request is not None and tool_parser:
+                  now_ids = tool_parser.get_token_ids(delta_text)
                   current_text += delta_text
                   current_token_ids += now_ids
 
-                  delta_message = self.tool_parser.extract_tool_calls_streaming(
+                  delta_message = tool_parser.extract_tool_calls_streaming(
                                   previous_text = previous_text,
                                   current_text = current_text,
                                   delta_text = delta_text,
