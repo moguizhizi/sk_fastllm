@@ -4,7 +4,7 @@
 #include <cub/cub.cuh>
 
 #include "batch_invariant.hpp"
-#include "cup_helpers.h"
+#include "cub_helpers.h"
 #include "kernel_macros.cuh"
 #include "type_convert.cuh"
 #include "vectorization_utils.cuh"

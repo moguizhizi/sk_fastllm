@@ -12,10 +12,12 @@
 #include <type_traits>
 
 #include "fastllm.h"
+#include "fastllm-cuda.cuh"
 #include "sampling.cuh"
 #include "utils/utils.h"
 #include "activation_kernels.cuh"
 #include "kernel_macros.cuh"
+#include "cub_helpers.h"
 
 #ifndef USE_ROCM
 #    define FASTLLM_LDG(arg) __ldg(arg)
@@ -4477,7 +4479,7 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
     }
     typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
-    float blockMax = BlockReduce(tempStorage).Reduce(localMax, cub::Max());
+    float blockMax = BlockReduce(tempStorage).Reduce(localMax, CubMaxOp{});
     if (threadIdx.x == 0) sMaxVal = blockMax;
     __syncthreads();
     float maxVal = sMaxVal;
