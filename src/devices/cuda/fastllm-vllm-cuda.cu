@@ -40,6 +40,6 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
     return rms_norm(input, weight, output, eps);
 }
 
-bool FastllmCudaFusedAddRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
-    return fused_add_rms_norm(input, weight, output, eps);
+bool FastllmCudaFusedAddRMSNorm(fastllm::Data &input, fastllm::Data &residual, const fastllm::Data &weight, float eps) {
+    return fused_add_rms_norm(input, residual, weight, eps);
 }

@@ -332,8 +332,23 @@ if (USE_CUDA)
     # 根据 ENABLE_VLLM_KERNEL 选择 activation kernel 实现
     if(ENABLE_VLLM_KERNEL)
         message(STATUS "Using vLLM activation kernels")
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; from torch.utils.cpp_extension import include_paths; print(';'.join(include_paths() + [sysconfig.get_paths()['include']]))"
+            OUTPUT_VARIABLE FASTLLM_TORCH_INCLUDE_DIRS
+            RESULT_VARIABLE FASTLLM_TORCH_INCLUDE_RESULT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT FASTLLM_TORCH_INCLUDE_RESULT EQUAL 0)
+            message(FATAL_ERROR "ENABLE_VLLM_KERNEL requires PyTorch with torch.utils.cpp_extension available")
+        endif()
+        include_directories(${FASTLLM_TORCH_INCLUDE_DIRS})
+        include_directories(src/devices)
+        include_directories(src/libtorch_stable/quantization)
         list(APPEND FASTLLM_CUDA_SOURCES
             src/devices/cuda/activation_kernels.cu
+            src/devices/cuda/layernorm_kernels.cu
+            src/devices/cuda/fastllm-vllm-cuda.cu
         )
     else()
         message(STATUS "Using fastllm activation kernels")
