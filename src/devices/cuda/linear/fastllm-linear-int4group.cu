@@ -981,6 +981,11 @@ static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, co
 }
 
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+#ifdef ENABLE_VLLM_KERNEL
+    if (TryFastllmCudaAwqGemm(input, weight, bias, output, n, m, k)) {
+        return true;
+    }
+#endif
     int group = weight.group, groupCnt = weight.groupCnt;
     bool useMarlin = FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
                      FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);

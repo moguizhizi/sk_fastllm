@@ -349,6 +349,7 @@ if (USE_CUDA)
             src/devices/cuda/activation_kernels.cu
             src/devices/cuda/layernorm_kernels.cu
             src/devices/cuda/fastllm-vllm-cuda.cu
+            src/devices/cuda/awq/fastllm-awq-vllm.cu
         )
     else()
         message(STATUS "Using fastllm activation kernels")
