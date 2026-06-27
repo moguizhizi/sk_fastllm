@@ -405,7 +405,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *lastPageLens,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, fastllm::DataType pagedDataType, int batch,
+    int pageLen, int maxPages, fastllm::DataType pagedDataType, int batch,
     int doQKNorm,
     int useLlama3 = 0, float llama3Factor = 1.0f,
     float llama3OriginalMaxPosition = 131072.0f,
@@ -584,7 +584,7 @@ bool FastllmCudaBFloat16MergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::
 bool FastllmCudaTritonLinearFP8E4M3Block128(
     const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
     const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
-    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight,
+    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight, bool stridedMatmul,
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
     int n, int m, int k);
 

@@ -80,6 +80,233 @@ namespace fastllm {
             }
         }
 
+        static bool ToolCallConstraintStartsWith(const std::string &text, const std::string &prefix) {
+            return text.size() >= prefix.size() &&
+                   memcmp(text.data(), prefix.data(), prefix.size()) == 0;
+        }
+
+        static bool FindLastPrefix(const std::string &text,
+                                   const std::vector<std::string> &prefixes,
+                                   std::string::size_type &bestPos,
+                                   const std::string **bestPrefix) {
+            bestPos = std::string::npos;
+            *bestPrefix = nullptr;
+            for (const auto &prefix : prefixes) {
+                if (prefix.empty()) {
+                    continue;
+                }
+                auto pos = text.rfind(prefix);
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                    *bestPrefix = &prefix;
+                }
+            }
+            return *bestPrefix != nullptr;
+        }
+
+        static bool FindLastPrefixBefore(const std::string &text,
+                                         const std::vector<std::string> &prefixes,
+                                         std::string::size_type exclusiveEnd,
+                                         std::string::size_type &bestPos) {
+            bestPos = std::string::npos;
+            if (exclusiveEnd == std::string::npos || exclusiveEnd > text.size()) {
+                exclusiveEnd = text.size();
+            }
+            for (const auto &prefix : prefixes) {
+                if (prefix.empty() || exclusiveEnd < prefix.size()) {
+                    continue;
+                }
+                auto pos = text.rfind(prefix, exclusiveEnd - prefix.size());
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                }
+            }
+            return bestPos != std::string::npos;
+        }
+
+        static std::string::size_type FindLastNeedleBefore(
+                const std::string &text,
+                const std::vector<std::string> &needles,
+                std::string::size_type exclusiveEnd) {
+            std::string::size_type bestPos = std::string::npos;
+            if (exclusiveEnd == std::string::npos || exclusiveEnd > text.size()) {
+                exclusiveEnd = text.size();
+            }
+            for (const auto &needle : needles) {
+                if (needle.empty() || exclusiveEnd < needle.size()) {
+                    continue;
+                }
+                auto pos = text.rfind(needle, exclusiveEnd - needle.size());
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                }
+            }
+            return bestPos;
+        }
+
+        static bool HasUnclosedToolCallParameterBefore(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string::size_type invokePos,
+                std::string::size_type parameterPos) {
+            std::string::size_type previousParameterPos = std::string::npos;
+            if (!FindLastPrefixBefore(text, config.tool_call_parameter_name_prefixes,
+                                      parameterPos, previousParameterPos) ||
+                previousParameterPos < invokePos) {
+                return false;
+            }
+
+            const std::vector<std::string> parameterCloseTags = {
+                    "</｜DSML｜parameter>",
+                    "</\\DSML\\parameter>",
+            };
+            auto closePos = FindLastNeedleBefore(text, parameterCloseTags, parameterPos);
+            if (closePos != std::string::npos && closePos > previousParameterPos) {
+                return false;
+            }
+            return true;
+        }
+
+        static bool FindActiveToolCallNamePartial(const std::string &text,
+                                                  const GenerationConfig &config,
+                                                  std::string &partial) {
+            if (!config.tool_call_name_constraint_enabled ||
+                config.tool_call_allowed_names.empty() ||
+                config.tool_call_invoke_name_prefixes.empty()) {
+                return false;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            std::string::size_type bestPos = std::string::npos;
+            const std::string *bestPrefix = nullptr;
+            if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
+                                bestPos, &bestPrefix)) {
+                return false;
+            }
+            auto nameStart = bestPos + bestPrefix->size();
+            if (text.find(terminator, nameStart) != std::string::npos) {
+                return false;
+            }
+            partial = text.substr(nameStart);
+            return true;
+        }
+
+        static bool FindActiveToolCallInvokeName(const std::string &text,
+                                                 const GenerationConfig &config,
+                                                 std::string &toolName,
+                                                 std::string::size_type &invokePos) {
+            if (config.tool_call_invoke_name_prefixes.empty()) {
+                return false;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            const std::string standardClose = "</｜DSML｜invoke>";
+            const std::string alternateClose = "</\\DSML\\invoke>";
+            std::string::size_type bestPos = std::string::npos;
+            const std::string *bestPrefix = nullptr;
+            if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
+                                bestPos, &bestPrefix)) {
+                return false;
+            }
+            auto nameStart = bestPos + bestPrefix->size();
+            auto terminatorPos = text.find(terminator, nameStart);
+            if (terminatorPos == std::string::npos) {
+                return false;
+            }
+            auto standardClosePos = text.rfind(standardClose);
+            auto alternateClosePos = text.rfind(alternateClose);
+            auto closePos = standardClosePos;
+            if (closePos == std::string::npos ||
+                (alternateClosePos != std::string::npos &&
+                 alternateClosePos > closePos)) {
+                closePos = alternateClosePos;
+            }
+            if (closePos != std::string::npos && closePos > bestPos) {
+                return false;
+            }
+            toolName = text.substr(nameStart, terminatorPos - nameStart);
+            invokePos = bestPos;
+            return !toolName.empty();
+        }
+
+        static bool FindActiveToolCallParameterNamePartial(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string &partial,
+                std::vector<std::string> &allowedNames) {
+            if (!config.tool_call_parameter_name_constraint_enabled ||
+                config.tool_call_allowed_parameter_names.empty() ||
+                config.tool_call_parameter_name_prefixes.empty()) {
+                return false;
+            }
+            std::string toolName;
+            std::string::size_type invokePos = std::string::npos;
+            if (!FindActiveToolCallInvokeName(text, config, toolName, invokePos)) {
+                return false;
+            }
+            auto allowedIt = config.tool_call_allowed_parameter_names.find(toolName);
+            if (allowedIt == config.tool_call_allowed_parameter_names.end() ||
+                allowedIt->second.empty()) {
+                return false;
+            }
+            std::string::size_type parameterPos = std::string::npos;
+            const std::string *parameterPrefix = nullptr;
+            if (!FindLastPrefix(text, config.tool_call_parameter_name_prefixes,
+                                parameterPos, &parameterPrefix)) {
+                return false;
+            }
+            if (parameterPos == std::string::npos || parameterPos < invokePos) {
+                return false;
+            }
+            if (HasUnclosedToolCallParameterBefore(text, config,
+                                                   invokePos, parameterPos)) {
+                return false;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            auto nameStart = parameterPos + parameterPrefix->size();
+            if (text.find(terminator, nameStart) != std::string::npos) {
+                return false;
+            }
+            partial = text.substr(nameStart);
+            allowedNames = allowedIt->second;
+            return true;
+        }
+
+        static bool IsToolCallEnumTokenAllowed(const std::string &partial,
+                                               const std::string &tokenText,
+                                               const std::vector<std::string> &allowedValues,
+                                               const std::string &terminator) {
+            if (tokenText.empty()) {
+                return false;
+            }
+            std::string combined = partial + tokenText;
+            auto terminatorPos = combined.find(terminator);
+            std::string namePart = terminatorPos == std::string::npos ?
+                                   combined : combined.substr(0, terminatorPos);
+            for (const auto &name : allowedValues) {
+                if (terminatorPos != std::string::npos) {
+                    if (namePart == name) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (ToolCallConstraintStartsWith(name, namePart)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         static bool IsPureGpuDeviceSpec(const std::string &device) {
 #ifndef USE_CUDA
             return false;
@@ -208,6 +435,7 @@ namespace fastllm {
             pastKeyValues.back().second.SetKVCache();
         }
         intParams.clear();
+        toolCallConstraintGeneratedText.clear();
         currentTokens.clear();
         allTokens.clear();
         while (resultTokenQueue.size() > 0){
@@ -228,6 +456,65 @@ namespace fastllm {
         this->TryRecordHistoryCache(context->allTokens);
         if (this->saveHistoryChat && this->UseGenericHistoryCache()) {
             this->pastKVCacheManager.Record(context->allTokens, context->allTokens.size(), &context->pastKeyValues);
+        }
+    }
+
+    void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        generationConfig.tool_call_allowed_token_ids.clear();
+        if (context == nullptr ||
+            (!generationConfig.tool_call_name_constraint_enabled &&
+             !generationConfig.tool_call_parameter_name_constraint_enabled)) {
+            return;
+        }
+        std::string partial;
+        std::vector<std::string> allowedValues;
+        if (!FindActiveToolCallParameterNamePartial(
+                    context->toolCallConstraintGeneratedText,
+                    generationConfig,
+                    partial,
+                    allowedValues)) {
+            if (!FindActiveToolCallNamePartial(
+                        context->toolCallConstraintGeneratedText,
+                        generationConfig,
+                        partial)) {
+                return;
+            }
+            allowedValues = generationConfig.tool_call_allowed_names;
+        }
+        if (allowedValues.empty()) {
+            return;
+        }
+
+        std::vector<int> allowedIds;
+        allowedIds.reserve(allowedValues.size() * 4);
+        const std::string terminator =
+                generationConfig.tool_call_name_terminator.empty()
+                ? "\"" : generationConfig.tool_call_name_terminator;
+        for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
+            int tokenId = item.first;
+            std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+            if (IsToolCallEnumTokenAllowed(partial, tokenText,
+                                           allowedValues, terminator)) {
+                allowedIds.push_back(tokenId);
+            }
+        }
+        std::sort(allowedIds.begin(), allowedIds.end());
+        allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
+        generationConfig.tool_call_allowed_token_ids = std::move(allowedIds);
+    }
+
+    void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
+        if (context == nullptr ||
+            (!context->generationConfig.tool_call_name_constraint_enabled &&
+             !context->generationConfig.tool_call_parameter_name_constraint_enabled) ||
+            tokenId < 0) {
+            return;
+        }
+        context->toolCallConstraintGeneratedText += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+        const size_t maxTrackedBytes = 8192;
+        if (context->toolCallConstraintGeneratedText.size() > maxTrackedBytes) {
+            context->toolCallConstraintGeneratedText.erase(
+                    0, context->toolCallConstraintGeneratedText.size() - maxTrackedBytes);
         }
     }
 
@@ -992,6 +1279,88 @@ namespace fastllm {
             return false;
         };
 
+        struct PageNeedState {
+            std::map<PagedCacheManager*, int> needs;
+            bool impossible = false;
+        };
+
+        auto mergePageNeeds = [](std::map<PagedCacheManager*, int> &dst,
+                                 const std::map<PagedCacheManager*, int> &src) {
+            for (auto &it : src) {
+                if (it.first != nullptr && it.second > 0) {
+                    dst[it.first] += it.second;
+                }
+            }
+        };
+
+        auto addManagerPageNeed = [](PagedCacheManager *manager, int currentTokens,
+                                     int currentPages, int appendTokens,
+                                     PageNeedState &state) {
+            if (manager == nullptr || appendTokens <= 0 ||
+                manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE ||
+                manager->pageLen <= 0) {
+                return;
+            }
+            currentTokens = std::max(0, currentTokens);
+            currentPages = std::max(0, currentPages);
+            int totalTokens = currentTokens + appendTokens;
+            int totalPages = (totalTokens + manager->pageLen - 1) / manager->pageLen;
+            if (totalPages > manager->maxPages) {
+                state.impossible = true;
+                return;
+            }
+            int newPages = totalPages - currentPages;
+            if (newPages > 0) {
+                state.needs[manager] += newPages;
+            }
+        };
+
+        auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) -> PageNeedState {
+            PageNeedState state;
+            if (ctx == nullptr || appendTokens <= 0) {
+                return state;
+            }
+
+            std::function<bool(Data&, int, PageNeedState&)> addExistingCacheNeed =
+                    [&](Data &cache, int tokens, PageNeedState &out) -> bool {
+                if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                    bool usedLocal = false;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            usedLocal = addExistingCacheNeed(*it.second, tokens, out) || usedLocal;
+                        }
+                    }
+                    if (usedLocal) {
+                        return true;
+                    }
+                }
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return false;
+                }
+                int currentPages = (int)cache.pageIndex.size();
+                int cachePageLen = cache.pageLen > 0 ? cache.pageLen : cache.pagedKVCacheData->pageLen;
+                int currentTokens = currentPages > 0 ?
+                        (currentPages - 1) * cachePageLen + cache.lastPageLen : 0;
+                addManagerPageNeed(cache.pagedKVCacheData, currentTokens, currentPages, tokens, out);
+                return true;
+            };
+
+            for (int li = 0; li < model->block_cnt && li < (int)ctx->pastKeyValues.size(); li++) {
+                for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                    bool isKey = keyFlag == 0;
+                    Data &cache = isKey ? ctx->pastKeyValues[li].first : ctx->pastKeyValues[li].second;
+                    if (addExistingCacheNeed(cache, appendTokens, state)) {
+                        continue;
+                    }
+                    auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                    for (auto &ref : refs) {
+                        addManagerPageNeed(ref.second, 0, 0, appendTokens, state);
+                    }
+                }
+            }
+            return state;
+        };
+
         auto *pcm = model->GetPagedKVCacheManager(model->kvCacheId, true);
         if (pcm != nullptr) {
             totalPages = pcm->maxPages;
@@ -1144,6 +1513,7 @@ namespace fastllm {
                 int curBusyPages = busyPages;
                 int pendingNewPages = 0;
                 bool selectedMultimodal = false;
+                std::map<PagedCacheManager*, int> selectedPrefillPageNeeds;
 
                 for (auto &ii : orders) {
                     ResponseContext *ctx = ii.context;
@@ -1166,12 +1536,19 @@ namespace fastllm {
                         continue;
                     }
 
-                    if ((maxTotalLens > 0 && ctx->cacheLen + ctx->currentTokens.size() > maxTotalLens) ||
-                        ctx->cacheLen + ctx->currentTokens.size() > model->max_positions) {
+                    int contextTokens = isPrompt ? ctx->cacheLen + (int)ctx->currentTokens.size() :
+                                                    (int)ctx->allTokens.size();
+                    if ((maxTotalLens > 0 && contextTokens > maxTotalLens) ||
+                        contextTokens > model->max_positions) {
                         ctx->isEnding = true;
                         ctx->error = ResponseContextErrorPromptTooLong;
                         // printf("[Handle %d] Finished. Reason: prompt too long (cacheLen=%d, currentTokens=%d, maxTotalLens=%d, max_positions=%d).\n",
                                // it.first, it.second->cacheLen, (int)it.second->currentTokens.size(), maxTotalLens, model->max_positions);
+                        continue;
+                    }
+                    if (!isPrompt && maxTotalLens > 0 && contextTokens >= maxTotalLens) {
+                        ctx->isEnding = true;
+                        ctx->TryRecordPagedCache(model);
                         continue;
                     }
 
@@ -1351,6 +1728,18 @@ namespace fastllm {
                         int thisLen = (int)ctx->currentTokens.size();
                         int thisPages = (thisLen + pageLen - 1) / pageLen;
 
+                        PageNeedState pageNeed = collectPrefillPageNeeds(ctx, thisLen);
+                        if (pageNeed.impossible) {
+                            ctx->isEnding = true;
+                            ctx->error = ResponseContextErrorPromptTooLong;
+                            continue;
+                        }
+                        std::map<PagedCacheManager*, int> combinedPrefillPageNeeds = selectedPrefillPageNeeds;
+                        mergePageNeeds(combinedPrefillPageNeeds, pageNeed.needs);
+                        if (hasPagedManagerShortage(combinedPrefillPageNeeds)) {
+                            continue;
+                        }
+
                         // Prefill后已用分页不能超过pagesLimit（除非单个请求就超过了）
                         if (pagesLimit > 0 && curBusyPages + thisPages > pagesLimit) {
                             bool noActiveRequests = currentActivate == 0 && seqLens.empty();
@@ -1378,16 +1767,19 @@ namespace fastllm {
                         prefillTokenCount += thisLen;
                         curBusyPages += thisPages;
                         pendingNewPages += thisPages;
+                        selectedPrefillPageNeeds.swap(combinedPrefillPageNeeds);
                         currentActivate++;
                     } else {
                         // Decode阶段：不在这里限制分页，由后续驱逐逻辑统一处理
                     }
 
                     generationConfigs.push_back(ctx->generationConfig);
-                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(ctx->generationConfig);
+                    model->PrepareToolCallConstraint(ctx, generationConfigs.back());
+                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(generationConfigs.back());
                     selectedNeedLastTokens |= ctxNeedRepeatPenalty ||
-                                              (ctx->generationConfig.output_logits &&
-                                               !ctx->generationConfig.IsSimpleGreedy());
+                                              (generationConfigs.back().output_logits &&
+                                               !generationConfigs.back().IsSimpleGreedy()) ||
+                                              !generationConfigs.back().tool_call_allowed_token_ids.empty();
                     logits.push_back(CreatePendingResultLogits(ctx->generationConfig));
 
                     tokenContexts.push_back(ctx);
@@ -1580,7 +1972,7 @@ namespace fastllm {
                         positionIds[0] == nullptr ? Data() : *positionIds[0],
                         singleContext->pastKeyValues,
                         singleContext->multimodalInput,
-                        singleContext->generationConfig,
+                        generationConfigs[0],
                         tokensManager,
                         &logits
                     );
@@ -1715,6 +2107,7 @@ namespace fastllm {
                         }
                     }
                     if (ctx->isEnding == false) {
+                        model->UpdateToolCallConstraintState(ctx, curRet);
                         if (ctx->currentTokens.size() == 1) {
                             ctx->currentTokens[0] = curRet;
                         } else {
@@ -1732,7 +2125,8 @@ namespace fastllm {
                             ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
                                    // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
-                        } else if (ctx->allTokens.size() >= model->max_positions) {
+                        } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
+                                   ctx->allTokens.size() >= model->max_positions) {
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
@@ -2002,6 +2396,7 @@ namespace fastllm {
                                 }
 
                                 generationConfigs.push_back(it.second->generationConfig);
+                                model->PrepareToolCallConstraint(it.second, generationConfigs.back());
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
                                 tokensManager.units.push_back(it.second->tokens);
@@ -2177,6 +2572,7 @@ namespace fastllm {
                                     }
                                 }
                                 if (it.second->isEnding == false) {
+                                    model->UpdateToolCallConstraintState(it.second, curRet);
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
                                     QueueGeneratedResultLogits(it.second, logits, i);
@@ -2622,10 +3018,19 @@ namespace fastllm {
     JinjaVar ChatMessagesToJinjaVar(const ChatMessages &messages) {
         JinjaVar ret = {{"messages", fastllm::JinjaArray {}}};
         for (auto &message : messages) {
-            ret["messages"].arrayValue.push_back({
+            auto msg = JinjaVar({
                 {"role", message.first},
                 {"content", message.second}
             });
+            std::string content = message.second;
+            size_t thinkEnd = content.find("</think>");
+            if (thinkEnd != std::string::npos) {
+                size_t thinkStart = content.find("<think>");
+                if (thinkStart != std::string::npos && thinkStart < thinkEnd) {
+                    msg["reasoning_content"] = content.substr(thinkStart + 7, thinkEnd - thinkStart - 7);
+                }
+            }
+            ret["messages"].arrayValue.push_back(msg);
         }
         ret["add_generation_prompt"] = fastllm::JinjaVar{1};
         ret["tools"] = fastllm::JinjaVar{std::vector <JinjaVar>()};
@@ -2916,6 +3321,16 @@ namespace fastllm {
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();
         bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
+        if (!autoCalcPages && fastllm::GetMaxTokens() > 0 && pageLen > 0) {
+            int maxWarmupLen = std::max(1, fastllm::GetMaxTokens() - pageLen);
+            if (len > maxWarmupLen) {
+                if (this->verbose) {
+                    printf("[Fastllm] AutoWarmup prefill length clamped from %d to %d by explicit KV cache token limit %d.\n",
+                           len, maxWarmupLen, fastllm::GetMaxTokens());
+                }
+                len = maxWarmupLen;
+            }
+        }
 #ifdef USE_CUDA
         const bool userSetMaxBatch = this->maxBatch > 0;
         const int userMaxBatch = this->maxBatch;
