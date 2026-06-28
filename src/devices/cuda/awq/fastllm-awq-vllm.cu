@@ -6,13 +6,13 @@
 
 namespace {
 
-bool FastllmVllmAwqTraceEnabled() {
-    static const bool enabled = (std::getenv("FASTLLM_TRACE_VLLM_AWQ") != nullptr);
+bool FastllmVllmKernelTraceEnabled() {
+    static const bool enabled = (std::getenv("FASTLLM_TRACE_VLLM_KERNEL") != nullptr);
     return enabled;
 }
 
-void FastllmVllmAwqTraceSkip(const char *reason, int n, int m, int k, int groupCnt) {
-    if (!FastllmVllmAwqTraceEnabled()) {
+void FastllmVllmKernelTraceSkip(const char *reason, int n, int m, int k, int groupCnt) {
+    if (!FastllmVllmKernelTraceEnabled()) {
         return;
     }
     printf("[Fastllm] vLLM AWQ GEMM skip: %s (n=%d m=%d k=%d groupCnt=%d)\n",
@@ -37,36 +37,32 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
     (void)bias;
     (void)output;
 
-    if (std::getenv("FASTLLM_ENABLE_VLLM_AWQ_GEMM") == nullptr) {
-        FastllmVllmAwqTraceSkip("FASTLLM_ENABLE_VLLM_AWQ_GEMM is not set", n, m, k, weight.groupCnt);
-        return false;
-    }
     if (input.dataType != fastllm::DataType::FLOAT16) {
-        FastllmVllmAwqTraceSkip("input is not FLOAT16", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("input is not FLOAT16", n, m, k, weight.groupCnt);
         return false;
     }
     if (weight.dataType != fastllm::DataType::INT4_GROUP) {
-        FastllmVllmAwqTraceSkip("weight is not INT4_GROUP", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("weight is not INT4_GROUP", n, m, k, weight.groupCnt);
         return false;
     }
     if (weight.cudaData == nullptr) {
-        FastllmVllmAwqTraceSkip("weight cudaData is null", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("weight cudaData is null", n, m, k, weight.groupCnt);
         return false;
     }
     if (weight.groupCnt <= 0 || weight.groupCnt % 32 != 0) {
-        FastllmVllmAwqTraceSkip("groupCnt is not a positive multiple of 32", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("groupCnt is not a positive multiple of 32", n, m, k, weight.groupCnt);
         return false;
     }
     if (m <= 0 || k <= 0 || n <= 0) {
-        FastllmVllmAwqTraceSkip("invalid matrix shape", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("invalid matrix shape", n, m, k, weight.groupCnt);
         return false;
     }
     if (m % weight.groupCnt != 0) {
-        FastllmVllmAwqTraceSkip("m is not divisible by groupCnt", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("m is not divisible by groupCnt", n, m, k, weight.groupCnt);
         return false;
     }
     if (k % 64 != 0) {
-        FastllmVllmAwqTraceSkip("k is not divisible by 64", n, m, k, weight.groupCnt);
+        FastllmVllmKernelTraceSkip("k is not divisible by 64", n, m, k, weight.groupCnt);
         return false;
     }
 
@@ -76,7 +72,7 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
     // INT4_GROUP weights as raw cudaData + scales/mins. The real kernel hook
     // should be added here after the vLLM kernel is converted to a raw-pointer
     // interface or an explicit qzeros cache is prepared from FastLLM mins.
-    FastllmVllmAwqTraceSkip("raw-pointer vLLM AWQ kernel bridge is not implemented yet", n, m, k, weight.groupCnt);
+    FastllmVllmKernelTraceSkip("raw-pointer vLLM AWQ kernel bridge is not implemented yet", n, m, k, weight.groupCnt);
     return false;
 #endif
 }
