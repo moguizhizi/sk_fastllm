@@ -53,7 +53,6 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
     (void)outChannels;
     return false;
 #else
-    (void)bias;
     (void)output;
 
     if (input.dataType != fastllm::DataType::FLOAT16) {
@@ -66,6 +65,10 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
     }
     if (weight.cudaData == nullptr) {
         FastllmVllmKernelTraceSkip("weight cudaData is null", numTokens, inChannels, outChannels, weight.groupCnt);
+        return false;
+    }
+    if (!bias.dims.empty() && bias.dataType != fastllm::DataType::FLOAT32) {
+        FastllmVllmKernelTraceSkip("bias is neither empty nor FLOAT32", numTokens, inChannels, outChannels, weight.groupCnt);
         return false;
     }
     if (weight.groupCnt <= 0 || weight.groupCnt % 32 != 0) {
