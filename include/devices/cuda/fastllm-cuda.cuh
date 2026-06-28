@@ -339,7 +339,7 @@ bool FastllmCudaMaskAndRemapExpertsForLocalRange(fastllm::Data &index, fastllm::
 bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);
 bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
-                           int n, int m, int k);
+                           int numTokens, int inChannels, int outChannels);
 
 bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
