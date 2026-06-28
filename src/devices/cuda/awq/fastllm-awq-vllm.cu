@@ -20,8 +20,12 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <vector>
 
 namespace {
+
+static constexpr int INT4GROUP_CUDA_SCALES_IDX = 0;
+static constexpr int INT4GROUP_CUDA_MINS_IDX = 1;
 
 bool FastllmVllmKernelTraceEnabled() {
     static const bool enabled = (std::getenv("FASTLLM_TRACE_VLLM_KERNEL") != nullptr);
@@ -39,17 +43,17 @@ void FastllmVllmKernelTraceSkip(const char *reason, int numTokens, int inChannel
 // 正确性优先的朴素 fused AWQ GEMM kernel。
 // 一个线程计算一个 output[token, outChannel]，直接读取 FastLLM INT4_GROUP：
 //   qweight[outChannel, inChannel / 2]，偶数 inChannel 在高 4bit，奇数在低 4bit。
-[[maybe_unused]] __global__ void FastllmCudaAwqGemmNaiveKernel(const half *input,
-                                                               const uint8_t *qweight,
-                                                               const half *scales,
-                                                               const half *mins,
-                                                               const float *bias,
-                                                               half *output,
-                                                               int numTokens,
-                                                               int inChannels,
-                                                               int outChannels,
-                                                               int groupCnt,
-                                                               int groups) {
+__global__ void FastllmCudaAwqGemmNaiveKernel(const half *input,
+                                              const uint8_t *qweight,
+                                              const half *scales,
+                                              const half *mins,
+                                              const float *bias,
+                                              half *output,
+                                              int numTokens,
+                                              int inChannels,
+                                              int outChannels,
+                                              int groupCnt,
+                                              int groups) {
     int outChannel = blockIdx.x * blockDim.x + threadIdx.x;
     int token = blockIdx.y * blockDim.y + threadIdx.y;
     if (token >= numTokens || outChannel >= outChannels) {
@@ -74,6 +78,42 @@ void FastllmVllmKernelTraceSkip(const char *reason, int numTokens, int inChannel
     output[(size_t)token * outChannels + outChannel] = __float2half(acc);
 }
 
+bool FastllmCudaAwqEnsureScalesMinsOnDevice(fastllm::Data &weight, int outChannels) {
+    int groups = weight.group;
+    if (groups <= 0 ||
+        weight.scales.size() != (size_t)outChannels * groups ||
+        weight.mins.size() != (size_t)outChannels * groups) {
+        return false;
+    }
+
+    if ((int)weight.extraCudaData.size() <= INT4GROUP_CUDA_MINS_IDX) {
+        weight.extraCudaData.resize(INT4GROUP_CUDA_MINS_IDX + 1, nullptr);
+    }
+
+    size_t count = (size_t)outChannels * groups;
+    if (weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX] == nullptr) {
+        std::vector<half> hostScales(count);
+        for (size_t i = 0; i < count; ++i) {
+            hostScales[i] = __float2half(weight.scales[i]);
+        }
+        half *cudaScales = (half*)FastllmCudaMalloc(count * sizeof(half));
+        FastllmCudaCopyFromHostToDevice(cudaScales, hostScales.data(), count * sizeof(half));
+        weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX] = cudaScales;
+    }
+
+    if (weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX] == nullptr) {
+        std::vector<half> hostMins(count);
+        for (size_t i = 0; i < count; ++i) {
+            hostMins[i] = __float2half(weight.mins[i]);
+        }
+        half *cudaMins = (half*)FastllmCudaMalloc(count * sizeof(half));
+        FastllmCudaCopyFromHostToDevice(cudaMins, hostMins.data(), count * sizeof(half));
+        weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX] = cudaMins;
+    }
+
+    return true;
+}
+
 }  // namespace
 
 // 可选 vLLM-inspired AWQ GEMM 路径的入口。
@@ -93,8 +133,6 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
     (void)outChannels;
     return false;
 #else
-    (void)output;
-
     if (input.dataType != fastllm::DataType::FLOAT16) {
         FastllmVllmKernelTraceSkip("input is not FLOAT16", numTokens, inChannels, outChannels, weight.groupCnt);
         return false;
@@ -127,11 +165,28 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
         FastllmVllmKernelTraceSkip("outChannels is not divisible by 64", numTokens, inChannels, outChannels, weight.groupCnt);
         return false;
     }
+    if (weight.group <= 0 || inChannels / weight.groupCnt != weight.group) {
+        FastllmVllmKernelTraceSkip("group metadata does not match inChannels/groupCnt", numTokens, inChannels, outChannels, weight.groupCnt);
+        return false;
+    }
+    if (!FastllmCudaAwqEnsureScalesMinsOnDevice(weight, outChannels)) {
+        FastllmVllmKernelTraceSkip("failed to prepare scales/mins", numTokens, inChannels, outChannels, weight.groupCnt);
+        return false;
+    }
 
-    // vLLM-inspired FastLLM 原生 fused AWQ GEMM 的占位实现。
-    // 真正实现时应直接消费 weight.cudaData、scales 和 mins，
-    // 而不是通过 vLLM 的 torch stable wrapper 转换。
-    FastllmVllmKernelTraceSkip("raw-pointer vLLM AWQ kernel bridge is not implemented yet", numTokens, inChannels, outChannels, weight.groupCnt);
-    return false;
+    half *cudaInput = (half*)FastllmCudaPrepareInput(input);
+    half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
+    half *cudaScales = (half*)weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX];
+    half *cudaMins = (half*)weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX];
+    const float *cudaBias = bias.dims.empty() ? nullptr : (const float*)bias.cudaData;
+
+    dim3 block(16, 16);
+    dim3 grid((outChannels + block.x - 1) / block.x,
+              (numTokens + block.y - 1) / block.y);
+    FastllmCudaAwqGemmNaiveKernel <<< grid, block >>>(
+        cudaInput, (const uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaBias,
+        cudaOutput, numTokens, inChannels, outChannels, weight.groupCnt, weight.group);
+    checkCudaErrors("Error: CUDA error when launching vLLM-inspired AWQ GEMM!", cudaGetLastError());
+    return true;
 #endif
 }
