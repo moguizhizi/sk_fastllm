@@ -1,3 +1,18 @@
+// 受 vLLM fused AWQ GEMM 思路启发的 FastLLM 原生 AWQ GEMM 路径。
+//
+// 本文件不直接调用 vLLM 的 torch::stable::Tensor awq_gemm wrapper。
+// FastLLM 的 INT4_GROUP 权重布局为：
+//   qweight: [outChannels, inChannels / 2] uint8
+//   scales:  [outChannels, groups]
+//   mins:    [outChannels, groups]
+// 而 vLLM 原始 AWQ GEMM 期望的布局为：
+//   qweight: [inChannels, outChannels / 8] int32
+//   scales:  [groups, outChannels]
+//   qzeros:  [groups, outChannels / 8]
+//
+// 这里借鉴的是 vLLM 的融合思路：加载 int4 权重、即时反量化并执行 GEMM，
+// 但直接消费 FastLLM 原生 INT4_GROUP 布局。
+
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
@@ -21,6 +36,10 @@ void FastllmVllmKernelTraceSkip(const char *reason, int numTokens, int inChannel
 
 }  // namespace
 
+// 可选 vLLM-inspired AWQ GEMM 路径的入口。
+// 只有当本路径已经成功写出 output 时才返回 true；对于不支持的 shape、
+// dtype 或尚未实现的部分返回 false，让原始 FastLLM INT4_GROUP fallback
+// 继续安全执行。
 bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
                            int numTokens, int inChannels, int outChannels) {
@@ -66,12 +85,9 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
         return false;
     }
 
-    // This adapter is intentionally kept as the only bridge between FastLLM's
-    // Data-based linear flow and the vLLM AWQ kernel family. The current vLLM
-    // awq_gemm entry takes torch::stable::Tensor objects, while FastLLM stores
-    // INT4_GROUP weights as raw cudaData + scales/mins. The real kernel hook
-    // should be added here after the vLLM kernel is converted to a raw-pointer
-    // interface or an explicit qzeros cache is prepared from FastLLM mins.
+    // vLLM-inspired FastLLM 原生 fused AWQ GEMM 的占位实现。
+    // 真正实现时应直接消费 weight.cudaData、scales 和 mins，
+    // 而不是通过 vLLM 的 torch stable wrapper 转换。
     FastllmVllmKernelTraceSkip("raw-pointer vLLM AWQ kernel bridge is not implemented yet", numTokens, inChannels, outChannels, weight.groupCnt);
     return false;
 #endif
