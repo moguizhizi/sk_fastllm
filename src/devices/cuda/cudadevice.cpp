@@ -2833,6 +2833,10 @@ namespace fastllm {
     }
 
     void DoCudaSwigluReshape(Data &input, Data &output) {
+        AssertInFastLLM(input.dims.size() > 0,
+                        "Activation gate error: input dims should not be empty.\n");
+        AssertInFastLLM((input.dims.back() % 2) == 0,
+                        "Activation gate error: input last dimension should be even.\n");
         std::vector <int> dims = input.dims;
         dims[dims.size() - 1] /= 2;
         output.dataType = input.dataType;
