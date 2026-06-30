@@ -15,7 +15,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
-#include "awq/fastllm-awq-vllm-kernel.cuh"
+#include "fastllm-awq-vllm-kernel.cuh"
 
 #include <cuda_fp16.h>
 
