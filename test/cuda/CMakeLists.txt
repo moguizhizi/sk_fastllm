@@ -21,3 +21,7 @@ add_executable(test_awq_gemm_compare
 target_link_libraries(test_awq_gemm_compare PRIVATE
     cuda_test_utils
 )
+
+target_include_directories(test_awq_gemm_compare PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/devices/cuda
+)
