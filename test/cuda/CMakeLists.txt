@@ -20,8 +20,11 @@ add_executable(test_awq_gemm_compare
 
 target_link_libraries(test_awq_gemm_compare PRIVATE
     cuda_test_utils
+    fastllm
 )
 
 target_include_directories(test_awq_gemm_compare PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/devices/cuda
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include/devices/cuda
 )
