@@ -3365,6 +3365,7 @@ bool FastllmCudaQKVRMSNormRope(fastllm::Data &qkv, fastllm::Data &qNormWeight, f
 //   - q_heads <= head_id < q_heads + k_heads: K head -> RMSNorm + RoPE -> 写入 paged K cache
 //   - head_id >= q_heads + k_heads: V head -> 直接拷贝到 paged V cache
 // ============================================================
+#ifndef ENABLE_VLLM_KERNEL
 template <int THREAD_PER_BLOCK, typename T, typename TKV>
 __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(T *qkvData, // [bs, seqlen, total_dim], 物理布局; 逻辑含义为 batch 个 token
     float *qNormWeight,                                                      // [head_dim]
@@ -3585,6 +3586,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(fastllm::Data &qkv, fastllm:
     // 注意: 不需要 FinishOutput qkv，因为 qkv 内容已经不再需要
     return true;
 }
+#endif
 
 bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
     float *cudaData = (float *)FastllmCudaPrepareInput(data);
