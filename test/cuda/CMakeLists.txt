@@ -6,3 +6,10 @@
 
 message(STATUS "CUDA kernel tests enabled")
 
+add_library(cuda_test_utils STATIC
+    test_utils.cpp
+)
+
+target_include_directories(cuda_test_utils PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
