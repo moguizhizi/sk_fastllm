@@ -4,9 +4,12 @@
 #include "fastllm.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <map>
 
 // vLLM kernel 分支的 CUDA 兼容层。
 // 这里用于承接 fastllm-cuda.cu 中的公共 CUDA 接口，避免 vLLM 算子替换时丢失链接符号。
@@ -33,6 +36,54 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
         cudaDeviceSynchronize();
     }
     return cudaMalloc(ret, size);
+}
+
+static bool FastllmCudaEnvFlagEnabled(const char *name) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 && std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 && std::strcmp(v, "OFF") != 0 &&
+           std::strcmp(v, "disable") != 0 && std::strcmp(v, "DISABLE") != 0;
+}
+
+bool FastllmCudaFlashInferSupported() {
+    static thread_local std::map<int, bool> supportedByDevice;
+    static thread_local std::map<int, bool> loggedByDevice;
+    static thread_local std::map<int, bool> forceNativeLoggedByDevice;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return false;
+    }
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        supportedByDevice[dev] = false;
+        return false;
+    }
+    if (FastllmCudaEnvFlagEnabled("FASTLLM_FORCE_NATIVE_ATTN")) {
+        if (forceNativeLoggedByDevice.find(dev) == forceNativeLoggedByDevice.end()) {
+            printf("[Fastllm] FlashInfer attention disabled by FASTLLM_FORCE_NATIVE_ATTN on GPU %d (CC %d.%d), using native attention.\n",
+                   dev, major, minor);
+            forceNativeLoggedByDevice[dev] = true;
+        }
+        return false;
+    }
+    auto it = supportedByDevice.find(dev);
+    if (it != supportedByDevice.end()) {
+        return it->second;
+    }
+    bool supported = major * 10 + minor >= 75;
+    supportedByDevice[dev] = supported;
+    if (!supported && loggedByDevice.find(dev) == loggedByDevice.end()) {
+        printf("[Fastllm] FlashInfer attention disabled on GPU %d (CC %d.%d), using native attention.\n",
+               dev, major, minor);
+        loggedByDevice[dev] = true;
+    }
+    return supported;
 }
 
 template <int THREAD_PER_BLOCK, typename T>
