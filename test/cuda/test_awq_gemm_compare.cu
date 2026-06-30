@@ -1,4 +1,6 @@
 #include "test_utils.h"
+#include "fastllm.h"
+#include "devices/cuda/fastllm-cuda.cuh"
 #include "awq/fastllm-awq-vllm-kernel.cuh"
 
 #include <cuda_fp16.h>
@@ -6,6 +8,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <vector>
 
@@ -43,6 +46,17 @@ std::vector<float> ToFloatVector(const std::vector<half> &values) {
 
 std::vector<float> RoundToHalfFloats(const std::vector<float> &values) {
     return ToFloatVector(ToHalfVector(values));
+}
+
+std::vector<float> DataHalfToFloat(fastllm::Data &data) {
+    data.ToDevice(fastllm::DataDevice::CPU);
+    size_t count = (size_t)data.Count(0);
+    std::vector<float> result(count);
+    const uint16_t *src = (const uint16_t*)data.cpuData;
+    for (size_t i = 0; i < count; ++i) {
+        result[i] = __half2float(*(const half*)&src[i]);
+    }
+    return result;
 }
 
 std::vector<float> AwqGemmCpuReference(const std::vector<float> &input,
@@ -182,6 +196,59 @@ bool RunGpuCompare(bool withBias) {
     return result.passed;
 }
 
+bool RunFastllmDataPathCompare(bool withBias) {
+    using namespace fastllm::cuda_test;
+
+    AwqGemmCase shape;
+    int groups = shape.inChannels / shape.groupCnt;
+    std::vector<float> input = MakeRandomFloats((size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 2001);
+    std::vector<uint8_t> qweight = MakeRandomInt4Weights(shape.outChannels, shape.inChannels, 2002);
+    std::vector<float> scales = MakeRandomFloats((size_t)shape.outChannels * groups, 0.001f, 0.05f, 2003);
+    std::vector<float> mins = MakeRandomFloats((size_t)shape.outChannels * groups, -0.4f, 0.1f, 2004);
+    std::vector<float> biasValues = MakeRandomFloats(shape.outChannels, -0.2f, 0.2f, 2005);
+
+    std::vector<float> inputRounded = RoundToHalfFloats(input);
+    std::vector<float> scalesRounded = RoundToHalfFloats(scales);
+    std::vector<float> minsRounded = RoundToHalfFloats(mins);
+    const std::vector<float> *biasPtr = withBias ? &biasValues : nullptr;
+    std::vector<float> expected = AwqGemmCpuReference(inputRounded, qweight, scalesRounded, minsRounded, biasPtr, shape);
+
+    fastllm::Data inputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.inChannels}, input);
+    inputData.ToDevice(fastllm::DataDevice::CUDA);
+
+    fastllm::Data weightData(fastllm::DataType::INT4_GROUP, {shape.outChannels, shape.inChannels});
+    weightData.groupCnt = shape.groupCnt;
+    weightData.group = groups;
+    weightData.scales = scales;
+    weightData.mins = mins;
+    weightData.Allocate(false);
+    std::memcpy(weightData.cpuData, qweight.data(), qweight.size());
+    weightData.ToDevice(fastllm::DataDevice::CUDA);
+
+    fastllm::Data emptyBias;
+    fastllm::Data biasData(fastllm::DataType::FLOAT32, {shape.outChannels}, biasValues);
+    if (withBias) {
+        biasData.ToDevice(fastllm::DataDevice::CUDA);
+    }
+    fastllm::Data &bias = withBias ? biasData : emptyBias;
+
+    fastllm::Data outputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.outChannels});
+    bool usedAwqPath = TryFastllmCudaAwqGemm(inputData, weightData, bias, outputData,
+                                             shape.numTokens, shape.inChannels, shape.outChannels);
+    Expect(usedAwqPath, "TryFastllmCudaAwqGemm returned false.");
+    CheckCuda(cudaDeviceSynchronize(), "sync TryFastllmCudaAwqGemm");
+
+    std::vector<float> actual = DataHalfToFloat(outputData);
+
+    constexpr float maxAbsTol = 2.0e-2f;
+    constexpr float meanAbsTol = 2.0e-3f;
+    constexpr float maxRelTol = 5.0e-2f;
+    CompareResult result = CompareVectors(expected, actual, maxAbsTol, meanAbsTol, maxRelTol);
+    PrintCompareResult(withBias ? "AWQ GEMM FastLLM Data path with bias" : "AWQ GEMM FastLLM Data path no bias",
+                       result, maxAbsTol, meanAbsTol, maxRelTol);
+    return result.passed;
+}
+
 }  // namespace
 
 int main() {
@@ -189,10 +256,12 @@ int main() {
         bool ok = true;
         ok = RunGpuCompare(false) && ok;
         ok = RunGpuCompare(true) && ok;
+        ok = RunFastllmDataPathCompare(false) && ok;
+        ok = RunFastllmDataPathCompare(true) && ok;
         if (!ok) {
             return 1;
         }
-        std::printf("[AWQ GEMM] GPU compare PASS\n");
+        std::printf("[AWQ GEMM] GPU and FastLLM Data path compare PASS\n");
         return 0;
     } catch (const std::exception &e) {
         std::printf("[AWQ GEMM] FAIL: %s\n", e.what());

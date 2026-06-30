@@ -8,17 +8,17 @@
 // 正确性优先的朴素 fused AWQ GEMM kernel。
 // 一个线程计算一个 output[token, outChannel]，直接读取 FastLLM INT4_GROUP：
 //   qweight[outChannel, inChannel / 2]，偶数 inChannel 在高 4bit，奇数在低 4bit。
-__global__ void FastllmCudaAwqGemmNaiveKernel(const half *input,
-                                              const uint8_t *qweight,
-                                              const half *scales,
-                                              const half *mins,
-                                              const float *bias,
-                                              half *output,
-                                              int numTokens,
-                                              int inChannels,
-                                              int outChannels,
-                                              int groupCnt,
-                                              int groups) {
+static __global__ void FastllmCudaAwqGemmNaiveKernel(const half *input,
+                                                     const uint8_t *qweight,
+                                                     const half *scales,
+                                                     const half *mins,
+                                                     const float *bias,
+                                                     half *output,
+                                                     int numTokens,
+                                                     int inChannels,
+                                                     int outChannels,
+                                                     int groupCnt,
+                                                     int groups) {
     int outChannel = blockIdx.x * blockDim.x + threadIdx.x;
     int token = blockIdx.y * blockDim.y + threadIdx.y;
     if (token >= numTokens || outChannel >= outChannels) {
