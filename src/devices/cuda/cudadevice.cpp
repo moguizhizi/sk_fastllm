@@ -2833,6 +2833,10 @@ namespace fastllm {
     }
 
     void DoCudaSwigluReshape(Data &input, Data &output) {
+        AssertInFastLLM(input.dims.size() > 0,
+                        "Activation gate error: input dims should not be empty.\n");
+        AssertInFastLLM((input.dims.back() % 2) == 0,
+                        "Activation gate error: input last dimension should be even.\n");
         std::vector <int> dims = input.dims;
         dims[dims.size() - 1] /= 2;
         output.dataType = input.dataType;
@@ -2874,8 +2878,9 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "CrossSwiglu error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CrossSwiglu error: Data's type should be float32, float16 or bfloat16.\n");
         output.Allocate();
         FastllmCudaCrossSwiglu(input, output);
     }

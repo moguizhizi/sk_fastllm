@@ -36,6 +36,7 @@ option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
+option(ENABLE_CUDA_TESTS "build standalone CUDA kernel tests" OFF)
 
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -143,6 +144,8 @@ message(STATUS "CUDA_MEM_DEBUG: ${CUDA_MEM_DEBUG}")
 message(STATUS "PYTHON_API: ${PY_API}")
 
 message(STATUS "BUILD_CLI: ${BUILD_CLI}")
+
+message(STATUS "ENABLE_CUDA_TESTS: ${ENABLE_CUDA_TESTS}")
 
 message(STATUS "USE_SENTENCEPIECE: ${USE_SENTENCEPIECE}")
 
@@ -568,6 +571,13 @@ if (UNIT_TEST)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
+endif()
+
+if (ENABLE_CUDA_TESTS)
+    if (NOT USE_CUDA)
+        message(FATAL_ERROR "ENABLE_CUDA_TESTS requires USE_CUDA=ON")
+    endif()
+    add_subdirectory(test/cuda)
 endif()
 
 add_executable(webui example/webui/webui.cpp)
