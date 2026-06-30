@@ -35,6 +35,166 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
     return cudaMalloc(ret, size);
 }
 
+bool FastllmCudaFlashInferSupported() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return false;
+    }
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        return false;
+    }
+    return major * 10 + minor >= 75;
+}
+
+__global__ void FastllmQwen35InterleavedRopeKernel(float *data, float *positionIds,
+                                                   int len, int spatial, int n, int m, int positionStride, int rotateDim,
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    int o = blockIdx.x / n;
+    int l = o % len;
+    int j = threadIdx.x;
+    int half = rotateDim / 2;
+    int row = 0;
+    if (j % 3 == 1 && j < sectionH * 3) {
+        row = 1;
+    } else if (j % 3 == 2 && j < sectionW * 3) {
+        row = 2;
+    }
+    float position = positionIds[row * positionStride + l] / ropeScale;
+    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float curSin = sinf(freq);
+    float curCos = cosf(freq);
+    float *d = data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = d[i * m];
+    float vb = d[i * m + half];
+    d[i * m] = va * curCos - vb * curSin;
+    d[i * m + half] = va * curSin + vb * curCos;
+}
+
+__global__ void FastllmQwen35InterleavedRopeKernel(half *data, float *positionIds,
+                                                   int len, int spatial, int n, int m, int positionStride, int rotateDim,
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    int o = blockIdx.x / n;
+    int l = o % len;
+    int j = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    int row = 0;
+    if (j % 3 == 1 && j < sectionH * 3) {
+        row = 1;
+    } else if (j % 3 == 2 && j < sectionW * 3) {
+        row = 2;
+    }
+    float position = positionIds[row * positionStride + l] / ropeScale;
+    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float curSin = sinf(freq);
+    float curCos = cosf(freq);
+    half *d = data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __half2float(d[i * m]);
+    float vb = __half2float(d[i * m + halfDim]);
+    d[i * m] = __float2half(va * curCos - vb * curSin);
+    d[i * m + halfDim] = __float2half(va * curSin + vb * curCos);
+}
+
+__global__ void FastllmQwen35InterleavedRopeKernel(__nv_bfloat16 *data, float *positionIds,
+                                                   int len, int spatial, int n, int m, int positionStride, int rotateDim,
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    int o = blockIdx.x / n;
+    int l = o % len;
+    int j = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    int row = 0;
+    if (j % 3 == 1 && j < sectionH * 3) {
+        row = 1;
+    } else if (j % 3 == 2 && j < sectionW * 3) {
+        row = 2;
+    }
+    float position = positionIds[row * positionStride + l] / ropeScale;
+    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float curSin = sinf(freq);
+    float curCos = cosf(freq);
+    __nv_bfloat16 *d = data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __bfloat162float(d[i * m]);
+    float vb = __bfloat162float(d[i * m + halfDim]);
+    d[i * m] = __float2bfloat16(va * curCos - vb * curSin);
+    d[i * m + halfDim] = __float2bfloat16(va * curSin + vb * curCos);
+}
+
+bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
+                                      int sectionT, int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    fastllm::AssertInFastLLM(data.dims.size() == 4, "Qwen3.5 interleaved RoPE expects [batch, seq, heads, dim] input.");
+    fastllm::AssertInFastLLM(data.dims[0] == 1, "Qwen3.5 interleaved RoPE currently supports batch size 1 only.");
+    fastllm::AssertInFastLLM(positionIds.dims.size() == 2 && positionIds.dims[0] == 3,
+                             "Qwen3.5 interleaved RoPE expects position ids with shape [3, seq].");
+    fastllm::AssertInFastLLM(sectionT + sectionH + sectionW == rotaryDim / 2,
+                             "Qwen3.5 interleaved RoPE section sizes must sum to rotary_dim / 2.");
+
+    float *cudaData = (float *)FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *)FastllmCudaPrepareInput(positionIds);
+
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int len = data.dims[1];
+    int n = data.dims[2];
+    int m = data.dims[3];
+    int halfDim = rotaryDim / 2;
+    int positionStride = (int)positionIds.dims.back();
+
+    if (data.dataType == fastllm::DataType::FLOAT32) {
+        FastllmQwen35InterleavedRopeKernel<<<outer * n, halfDim>>>(
+            cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+    } else if (data.dataType == fastllm::DataType::FLOAT16) {
+        FastllmQwen35InterleavedRopeKernel<<<outer * n, halfDim>>>(
+            (half *)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+    } else if (data.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmQwen35InterleavedRopeKernel<<<outer * n, halfDim>>>(
+            (__nv_bfloat16 *)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim, sectionH, sectionW, ropeTheta,
+            ropeScale);
+    }
+
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishOutput(data, cudaData);
+    return true;
+}
+
+bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+    fastllm::Data &qkv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds, fastllm::Data &qOutput,
+    uint8_t *pagedKData, uint8_t *pagedVData, int32_t *insertIndexs,
+    int32_t *insertPositions, int q_heads, int k_heads, int head_dim,
+    int rotateDim, float eps, float ropeTheta, float ropeScale, int pageLen,
+    fastllm::DataType pagedDataType, int batch, int doQKNorm);
+
+bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+    fastllm::Data &qkv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds, fastllm::Data &qOutput,
+    uint8_t *pagedKData, uint8_t *pagedVData,
+    int32_t *insertIndexs, int32_t *insertPositions, int32_t *lastPageLens,
+    int q_heads, int k_heads, int head_dim,
+    int rotateDim, float eps, float ropeTheta, float ropeScale,
+    int pageLen, int maxPages, fastllm::DataType pagedDataType, int batch,
+    int doQKNorm,
+    int useLlama3, float llama3Factor,
+    float llama3OriginalMaxPosition,
+    float llama3LowFreqFactor,
+    float llama3HighFreqFactor) {
+    (void)lastPageLens;
+    (void)maxPages;
+    (void)useLlama3;
+    (void)llama3Factor;
+    (void)llama3OriginalMaxPosition;
+    (void)llama3LowFreqFactor;
+    (void)llama3HighFreqFactor;
+    return FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+        qkv, qNormWeight, kNormWeight, positionIds, qOutput, pagedKData, pagedVData,
+        insertIndexs, insertPositions, q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
+        pageLen, pagedDataType, batch, doQKNorm);
+}
+
 template <int THREAD_PER_BLOCK, typename T>
 __global__ void FastllmRMSNormPartSum2Kernel(const T *input, float *sumOut, int outer, int channels, int start, int end) {
     int o = blockIdx.x;
