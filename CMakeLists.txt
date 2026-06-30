@@ -351,6 +351,7 @@ if (USE_CUDA)
         list(APPEND FASTLLM_CUDA_SOURCES
             src/devices/cuda/activation_kernels.cu
             src/devices/cuda/layernorm_kernels.cu
+            src/devices/cuda/fastllm-cuda-vllm-compat.cu
             src/devices/cuda/fastllm-vllm-cuda.cu
             src/devices/cuda/awq/fastllm-awq-vllm.cu
         )
