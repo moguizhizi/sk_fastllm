@@ -25,6 +25,20 @@
 #    define FASTLLM_LDG(arg) *(arg)
 #endif
 
+#ifdef cudaMalloc
+#undef cudaMalloc
+#define FASTLLM_RESTORE_CUDA_MALLOC_CHECK_MACRO
+#endif
+cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+    (void)file;
+    (void)line;
+    return cudaMalloc(ret, size);
+}
+#ifdef FASTLLM_RESTORE_CUDA_MALLOC_CHECK_MACRO
+#define cudaMalloc(ptr, size) FastllmCudaCheckedMalloc((void **)(ptr), (size), __FILE__, __LINE__)
+#undef FASTLLM_RESTORE_CUDA_MALLOC_CHECK_MACRO
+#endif
+
 #define FASTLLM_LAUNCH_ACTIVATION_GATE_KERNEL(ACT_FN, PACKED_ACT_FN, ACT_FIRST)                                                         \
     if (vec_config.use_vec) {                                                                                                           \
         if (use_256b_flag) {                                                                                                            \
