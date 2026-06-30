@@ -1,5 +1,12 @@
 
 
+#pragma once
+
+#include "vectorization.cuh"
+
+#include <cstdint>
+#include <type_traits>
+
 namespace fastllm {
 template <int VEC_SIZE, typename InT, typename ScaOp>
 struct DefaultReadVecOp {
@@ -9,6 +16,18 @@ struct DefaultReadVecOp {
 #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
             scalar_op(src.val[i]);
+        }
+    }
+};
+
+template <int VEC_SIZE, typename InT, typename OutT, typename ScaOp>
+struct DefaultVecOp {
+    ScaOp scalar_op;
+
+    __device__ __forceinline__ void operator()(vec_n_t<OutT, VEC_SIZE> &dst, const vec_n_t<InT, VEC_SIZE> &src) const {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            scalar_op(dst.val[i], src.val[i]);
         }
     }
 };
