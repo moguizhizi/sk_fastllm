@@ -233,6 +233,7 @@ bool RunFastllmDataPathCompare(bool withBias) {
     fastllm::Data &bias = withBias ? biasData : emptyBias;
 
     fastllm::Data outputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.outChannels});
+    outputData.Allocate(false);
     bool usedAwqPath = TryFastllmCudaAwqGemm(inputData, weightData, bias, outputData,
                                              shape.numTokens, shape.inChannels, shape.outChannels);
     Expect(usedAwqPath, "TryFastllmCudaAwqGemm returned false.");
