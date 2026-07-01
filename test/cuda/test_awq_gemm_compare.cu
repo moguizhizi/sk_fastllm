@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string>
 #include <vector>
 
 namespace {
@@ -196,16 +197,16 @@ bool RunGpuCompare(bool withBias) {
     return result.passed;
 }
 
-bool RunFastllmDataPathCompare(bool withBias) {
+bool RunFastllmDataPathCompareCase(const AwqGemmCase &shape, bool withBias,
+                                   uint32_t seedBase, const std::string &name) {
     using namespace fastllm::cuda_test;
 
-    AwqGemmCase shape;
     int groups = shape.inChannels / shape.groupCnt;
-    std::vector<float> input = MakeRandomFloats((size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 2001);
-    std::vector<uint8_t> qweight = MakeRandomInt4Weights(shape.outChannels, shape.inChannels, 2002);
-    std::vector<float> scales = MakeRandomFloats((size_t)shape.outChannels * groups, 0.001f, 0.05f, 2003);
-    std::vector<float> mins = MakeRandomFloats((size_t)shape.outChannels * groups, -0.4f, 0.1f, 2004);
-    std::vector<float> biasValues = MakeRandomFloats(shape.outChannels, -0.2f, 0.2f, 2005);
+    std::vector<float> input = MakeRandomFloats((size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, seedBase + 1);
+    std::vector<uint8_t> qweight = MakeRandomInt4Weights(shape.outChannels, shape.inChannels, seedBase + 2);
+    std::vector<float> scales = MakeRandomFloats((size_t)shape.outChannels * groups, 0.001f, 0.05f, seedBase + 3);
+    std::vector<float> mins = MakeRandomFloats((size_t)shape.outChannels * groups, -0.4f, 0.1f, seedBase + 4);
+    std::vector<float> biasValues = MakeRandomFloats(shape.outChannels, -0.2f, 0.2f, seedBase + 5);
 
     std::vector<float> inputRounded = RoundToHalfFloats(input);
     std::vector<float> scalesRounded = RoundToHalfFloats(scales);
@@ -245,9 +246,196 @@ bool RunFastllmDataPathCompare(bool withBias) {
     constexpr float meanAbsTol = 2.0e-3f;
     constexpr float maxRelTol = 5.0e-2f;
     CompareResult result = CompareVectors(expected, actual, maxAbsTol, meanAbsTol, maxRelTol);
-    PrintCompareResult(withBias ? "AWQ GEMM FastLLM Data path with bias" : "AWQ GEMM FastLLM Data path no bias",
-                       result, maxAbsTol, meanAbsTol, maxRelTol);
+    PrintCompareResult(name, result, maxAbsTol, meanAbsTol, maxRelTol);
     return result.passed;
+}
+
+bool RunFastllmDataPathCompare(bool withBias) {
+    AwqGemmCase shape;
+    return RunFastllmDataPathCompareCase(
+        shape, withBias, 2000,
+        withBias ? "AWQ GEMM FastLLM Data path with bias" : "AWQ GEMM FastLLM Data path no bias");
+}
+
+bool RunRealShapeCompare() {
+    std::vector<AwqGemmCase> cases = {
+        {1, 1024, 1024, 128},
+        {4, 1024, 2048, 128},
+        {1, 4096, 4096, 128},
+    };
+
+    bool ok = true;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const AwqGemmCase &shape = cases[i];
+        std::string prefix = "AWQ GEMM real shape tokens=" + std::to_string(shape.numTokens) +
+                             " ic=" + std::to_string(shape.inChannels) +
+                             " oc=" + std::to_string(shape.outChannels) +
+                             " group=" + std::to_string(shape.groupCnt);
+        ok = RunFastllmDataPathCompareCase(shape, false, 5000 + (uint32_t)i * 20, prefix + " no bias") && ok;
+        ok = RunFastllmDataPathCompareCase(shape, true, 6000 + (uint32_t)i * 20, prefix + " with bias") && ok;
+    }
+    return ok;
+}
+
+int GetBenchmarkIters() {
+    const char *value = std::getenv("FASTLLM_AWQ_BENCH_ITERS");
+    if (value == nullptr) {
+        return 10;
+    }
+    int iters = std::atoi(value);
+    return iters > 0 ? iters : 10;
+}
+
+float BenchmarkRawKernel(const AwqGemmCase &shape, int warmup, int iters) {
+    int groups = shape.inChannels / shape.groupCnt;
+    std::vector<float> input = fastllm::cuda_test::MakeRandomFloats(
+        (size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 3001);
+    std::vector<uint8_t> qweight = fastllm::cuda_test::MakeRandomInt4Weights(
+        shape.outChannels, shape.inChannels, 3002);
+    std::vector<float> scales = fastllm::cuda_test::MakeRandomFloats(
+        (size_t)shape.outChannels * groups, 0.001f, 0.05f, 3003);
+    std::vector<float> mins = fastllm::cuda_test::MakeRandomFloats(
+        (size_t)shape.outChannels * groups, -0.4f, 0.1f, 3004);
+
+    std::vector<half> inputHalf = ToHalfVector(input);
+    std::vector<half> scalesHalf = ToHalfVector(scales);
+    std::vector<half> minsHalf = ToHalfVector(mins);
+
+    size_t inputBytes = inputHalf.size() * sizeof(half);
+    size_t qweightBytes = qweight.size() * sizeof(uint8_t);
+    size_t scaleBytes = scalesHalf.size() * sizeof(half);
+    size_t minBytes = minsHalf.size() * sizeof(half);
+    size_t outputBytes = (size_t)shape.numTokens * shape.outChannels * sizeof(half);
+
+    half *dInput = nullptr;
+    uint8_t *dQweight = nullptr;
+    half *dScales = nullptr;
+    half *dMins = nullptr;
+    half *dOutput = nullptr;
+
+    CheckCuda(cudaMalloc(&dInput, inputBytes), "bench malloc input");
+    CheckCuda(cudaMalloc(&dQweight, qweightBytes), "bench malloc qweight");
+    CheckCuda(cudaMalloc(&dScales, scaleBytes), "bench malloc scales");
+    CheckCuda(cudaMalloc(&dMins, minBytes), "bench malloc mins");
+    CheckCuda(cudaMalloc(&dOutput, outputBytes), "bench malloc output");
+    CheckCuda(cudaMemcpy(dInput, inputHalf.data(), inputBytes, cudaMemcpyHostToDevice), "bench copy input");
+    CheckCuda(cudaMemcpy(dQweight, qweight.data(), qweightBytes, cudaMemcpyHostToDevice), "bench copy qweight");
+    CheckCuda(cudaMemcpy(dScales, scalesHalf.data(), scaleBytes, cudaMemcpyHostToDevice), "bench copy scales");
+    CheckCuda(cudaMemcpy(dMins, minsHalf.data(), minBytes, cudaMemcpyHostToDevice), "bench copy mins");
+
+    dim3 block(16, 16);
+    dim3 grid((shape.outChannels + block.x - 1) / block.x,
+              (shape.numTokens + block.y - 1) / block.y);
+    for (int i = 0; i < warmup; ++i) {
+        FastllmCudaAwqGemmNaiveKernel <<< grid, block >>>(
+            dInput, dQweight, dScales, dMins, nullptr, dOutput,
+            shape.numTokens, shape.inChannels, shape.outChannels, shape.groupCnt, groups);
+    }
+    CheckCuda(cudaGetLastError(), "bench launch raw warmup");
+    CheckCuda(cudaDeviceSynchronize(), "bench sync raw warmup");
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    CheckCuda(cudaEventCreate(&start), "bench create raw start event");
+    CheckCuda(cudaEventCreate(&stop), "bench create raw stop event");
+    CheckCuda(cudaEventRecord(start), "bench record raw start");
+    for (int i = 0; i < iters; ++i) {
+        FastllmCudaAwqGemmNaiveKernel <<< grid, block >>>(
+            dInput, dQweight, dScales, dMins, nullptr, dOutput,
+            shape.numTokens, shape.inChannels, shape.outChannels, shape.groupCnt, groups);
+    }
+    CheckCuda(cudaEventRecord(stop), "bench record raw stop");
+    CheckCuda(cudaEventSynchronize(stop), "bench sync raw stop");
+    CheckCuda(cudaGetLastError(), "bench launch raw timed");
+
+    float elapsedMs = 0.0f;
+    CheckCuda(cudaEventElapsedTime(&elapsedMs, start, stop), "bench elapsed raw");
+
+    CheckCuda(cudaEventDestroy(start), "bench destroy raw start event");
+    CheckCuda(cudaEventDestroy(stop), "bench destroy raw stop event");
+    CheckCuda(cudaFree(dInput), "bench free input");
+    CheckCuda(cudaFree(dQweight), "bench free qweight");
+    CheckCuda(cudaFree(dScales), "bench free scales");
+    CheckCuda(cudaFree(dMins), "bench free mins");
+    CheckCuda(cudaFree(dOutput), "bench free output");
+    return elapsedMs / iters;
+}
+
+float BenchmarkFastllmDataPath(const AwqGemmCase &shape, int warmup, int iters) {
+    using fastllm::cuda_test::Expect;
+
+    int groups = shape.inChannels / shape.groupCnt;
+    std::vector<float> input = fastllm::cuda_test::MakeRandomFloats(
+        (size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 4001);
+    std::vector<uint8_t> qweight = fastllm::cuda_test::MakeRandomInt4Weights(
+        shape.outChannels, shape.inChannels, 4002);
+    std::vector<float> scales = fastllm::cuda_test::MakeRandomFloats(
+        (size_t)shape.outChannels * groups, 0.001f, 0.05f, 4003);
+    std::vector<float> mins = fastllm::cuda_test::MakeRandomFloats(
+        (size_t)shape.outChannels * groups, -0.4f, 0.1f, 4004);
+
+    fastllm::Data inputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.inChannels}, input);
+    inputData.ToDevice(fastllm::DataDevice::CUDA);
+
+    fastllm::Data weightData(fastllm::DataType::INT4_GROUP, {shape.outChannels, shape.inChannels});
+    weightData.groupCnt = shape.groupCnt;
+    weightData.group = groups;
+    weightData.scales = scales;
+    weightData.mins = mins;
+    weightData.Allocate(false);
+    std::memcpy(weightData.cpuData, qweight.data(), qweight.size());
+    weightData.ToDevice(fastllm::DataDevice::CUDA);
+
+    fastllm::Data emptyBias;
+    fastllm::Data outputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.outChannels});
+    outputData.Allocate(false);
+    outputData.ToDevice(fastllm::DataDevice::CUDA, false);
+
+    for (int i = 0; i < warmup; ++i) {
+        bool usedAwqPath = TryFastllmCudaAwqGemm(inputData, weightData, emptyBias, outputData,
+                                                 shape.numTokens, shape.inChannels, shape.outChannels);
+        Expect(usedAwqPath, "bench TryFastllmCudaAwqGemm returned false during warmup.");
+    }
+    CheckCuda(cudaDeviceSynchronize(), "bench sync data path warmup");
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    CheckCuda(cudaEventCreate(&start), "bench create data path start event");
+    CheckCuda(cudaEventCreate(&stop), "bench create data path stop event");
+    CheckCuda(cudaEventRecord(start), "bench record data path start");
+    for (int i = 0; i < iters; ++i) {
+        bool usedAwqPath = TryFastllmCudaAwqGemm(inputData, weightData, emptyBias, outputData,
+                                                 shape.numTokens, shape.inChannels, shape.outChannels);
+        Expect(usedAwqPath, "bench TryFastllmCudaAwqGemm returned false.");
+    }
+    CheckCuda(cudaEventRecord(stop), "bench record data path stop");
+    CheckCuda(cudaEventSynchronize(stop), "bench sync data path stop");
+    CheckCuda(cudaGetLastError(), "bench launch data path timed");
+
+    float elapsedMs = 0.0f;
+    CheckCuda(cudaEventElapsedTime(&elapsedMs, start, stop), "bench elapsed data path");
+    CheckCuda(cudaEventDestroy(start), "bench destroy data path start event");
+    CheckCuda(cudaEventDestroy(stop), "bench destroy data path stop event");
+    return elapsedMs / iters;
+}
+
+void RunAwqGemmBenchmark() {
+    int iters = GetBenchmarkIters();
+    constexpr int warmup = 3;
+    std::vector<AwqGemmCase> cases = {
+        {1, 1024, 1024, 128},
+        {4, 1024, 2048, 128},
+        {1, 4096, 4096, 128},
+    };
+
+    std::printf("[AWQ GEMM bench] warmup=%d iters=%d\n", warmup, iters);
+    for (const AwqGemmCase &shape : cases) {
+        float rawMs = BenchmarkRawKernel(shape, warmup, iters);
+        float dataPathMs = BenchmarkFastllmDataPath(shape, warmup, iters);
+        std::printf("[AWQ GEMM bench] tokens=%d ic=%d oc=%d group=%d raw_kernel=%.4f ms data_path=%.4f ms\n",
+                    shape.numTokens, shape.inChannels, shape.outChannels, shape.groupCnt,
+                    rawMs, dataPathMs);
+    }
 }
 
 }  // namespace
@@ -259,9 +447,11 @@ int main() {
         ok = RunGpuCompare(true) && ok;
         ok = RunFastllmDataPathCompare(false) && ok;
         ok = RunFastllmDataPathCompare(true) && ok;
+        ok = RunRealShapeCompare() && ok;
         if (!ok) {
             return 1;
         }
+        RunAwqGemmBenchmark();
         std::printf("[AWQ GEMM] GPU and FastLLM Data path compare PASS\n");
         return 0;
     } catch (const std::exception &e) {
