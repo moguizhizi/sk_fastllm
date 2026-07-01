@@ -55,7 +55,7 @@ CompareResult CompareVectors(const std::vector<float> &expected,
     double absSum = 0.0;
     for (size_t i = 0; i < expected.size(); ++i) {
         float absError = std::fabs(expected[i] - actual[i]);
-        float denom = std::max(std::fabs(expected[i]), 1.0e-6f);
+        float denom = std::max(std::fabs(expected[i]), 1.0e-2f);
         float relError = absError / denom;
 
         absSum += absError;

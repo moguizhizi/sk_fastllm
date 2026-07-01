@@ -73,6 +73,17 @@ std::vector<float> RoundToHalfFloats(const std::vector<float> &values) {
     return ToFloatVector(ToHalfVector(values));
 }
 
+void MakeAwqScalesAndMins(size_t count, uint32_t seed,
+                          std::vector<float> &scales,
+                          std::vector<float> &mins) {
+    scales = fastllm::cuda_test::MakeRandomFloats(count, 0.001f, 0.05f, seed);
+    mins.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        int zero = (int)((seed + i * 17) % 16);
+        mins[i] = -scales[i] * zero;
+    }
+}
+
 std::vector<float> DataHalfToFloat(fastllm::Data &data) {
     data.ToDevice(fastllm::DataDevice::CPU);
     size_t count = (size_t)data.Count(0);
@@ -197,8 +208,9 @@ bool RunGpuCompare(bool withBias) {
     int groups = shape.inChannels / shape.groupCnt;
     std::vector<float> input = MakeRandomFloats((size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 1001);
     std::vector<uint8_t> qweight = MakeRandomInt4Weights(shape.outChannels, shape.inChannels, 1002);
-    std::vector<float> scales = MakeRandomFloats((size_t)shape.outChannels * groups, 0.001f, 0.05f, 1003);
-    std::vector<float> mins = MakeRandomFloats((size_t)shape.outChannels * groups, -0.4f, 0.1f, 1004);
+    std::vector<float> scales;
+    std::vector<float> mins;
+    MakeAwqScalesAndMins((size_t)shape.outChannels * groups, 1003, scales, mins);
     std::vector<float> bias = MakeRandomFloats(shape.outChannels, -0.2f, 0.2f, 1005);
 
     std::vector<half> inputHalf = ToHalfVector(input);
@@ -228,8 +240,9 @@ bool RunFastllmDataPathCompareCase(const AwqGemmCase &shape, bool withBias,
     int groups = shape.inChannels / shape.groupCnt;
     std::vector<float> input = MakeRandomFloats((size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, seedBase + 1);
     std::vector<uint8_t> qweight = MakeRandomInt4Weights(shape.outChannels, shape.inChannels, seedBase + 2);
-    std::vector<float> scales = MakeRandomFloats((size_t)shape.outChannels * groups, 0.001f, 0.05f, seedBase + 3);
-    std::vector<float> mins = MakeRandomFloats((size_t)shape.outChannels * groups, -0.4f, 0.1f, seedBase + 4);
+    std::vector<float> scales;
+    std::vector<float> mins;
+    MakeAwqScalesAndMins((size_t)shape.outChannels * groups, seedBase + 3, scales, mins);
     std::vector<float> biasValues = MakeRandomFloats(shape.outChannels, -0.2f, 0.2f, seedBase + 5);
 
     std::vector<float> inputRounded = RoundToHalfFloats(input);
@@ -308,8 +321,9 @@ bool RunFastllmOriginalCompareCase(const AwqGemmCase &shape, bool withBias,
     int groups = shape.inChannels / shape.groupCnt;
     std::vector<float> input = MakeRandomFloats((size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, seedBase + 1);
     std::vector<uint8_t> qweight = MakeRandomInt4Weights(shape.outChannels, shape.inChannels, seedBase + 2);
-    std::vector<float> scales = MakeRandomFloats((size_t)shape.outChannels * groups, 0.001f, 0.05f, seedBase + 3);
-    std::vector<float> mins = MakeRandomFloats((size_t)shape.outChannels * groups, -0.4f, 0.1f, seedBase + 4);
+    std::vector<float> scales;
+    std::vector<float> mins;
+    MakeAwqScalesAndMins((size_t)shape.outChannels * groups, seedBase + 3, scales, mins);
     std::vector<float> biasValues = MakeRandomFloats(shape.outChannels, -0.2f, 0.2f, seedBase + 5);
 
     std::vector<float> inputRounded = RoundToHalfFloats(input);
@@ -408,10 +422,9 @@ float BenchmarkRawKernel(const AwqGemmCase &shape, int warmup, int iters) {
         (size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 3001);
     std::vector<uint8_t> qweight = fastllm::cuda_test::MakeRandomInt4Weights(
         shape.outChannels, shape.inChannels, 3002);
-    std::vector<float> scales = fastllm::cuda_test::MakeRandomFloats(
-        (size_t)shape.outChannels * groups, 0.001f, 0.05f, 3003);
-    std::vector<float> mins = fastllm::cuda_test::MakeRandomFloats(
-        (size_t)shape.outChannels * groups, -0.4f, 0.1f, 3004);
+    std::vector<float> scales;
+    std::vector<float> mins;
+    MakeAwqScalesAndMins((size_t)shape.outChannels * groups, 3003, scales, mins);
 
     std::vector<half> inputHalf = ToHalfVector(input);
     std::vector<half> scalesHalf = ToHalfVector(scales);
@@ -485,10 +498,9 @@ float BenchmarkFastllmDataPath(const AwqGemmCase &shape, int warmup, int iters) 
         (size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 4001);
     std::vector<uint8_t> qweight = fastllm::cuda_test::MakeRandomInt4Weights(
         shape.outChannels, shape.inChannels, 4002);
-    std::vector<float> scales = fastllm::cuda_test::MakeRandomFloats(
-        (size_t)shape.outChannels * groups, 0.001f, 0.05f, 4003);
-    std::vector<float> mins = fastllm::cuda_test::MakeRandomFloats(
-        (size_t)shape.outChannels * groups, -0.4f, 0.1f, 4004);
+    std::vector<float> scales;
+    std::vector<float> mins;
+    MakeAwqScalesAndMins((size_t)shape.outChannels * groups, 4003, scales, mins);
 
     fastllm::Data inputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.inChannels}, input);
     inputData.ToDevice(fastllm::DataDevice::CUDA);
@@ -541,10 +553,9 @@ float BenchmarkFastllmOriginalPath(const AwqGemmCase &shape, int warmup, int ite
         (size_t)shape.numTokens * shape.inChannels, -1.0f, 1.0f, 5001);
     std::vector<uint8_t> qweight = fastllm::cuda_test::MakeRandomInt4Weights(
         shape.outChannels, shape.inChannels, 5002);
-    std::vector<float> scales = fastllm::cuda_test::MakeRandomFloats(
-        (size_t)shape.outChannels * groups, 0.001f, 0.05f, 5003);
-    std::vector<float> mins = fastllm::cuda_test::MakeRandomFloats(
-        (size_t)shape.outChannels * groups, -0.4f, 0.1f, 5004);
+    std::vector<float> scales;
+    std::vector<float> mins;
+    MakeAwqScalesAndMins((size_t)shape.outChannels * groups, 5003, scales, mins);
 
     fastllm::Data inputData(fastllm::DataType::FLOAT16, {shape.numTokens, shape.inChannels}, input);
     inputData.ToDevice(fastllm::DataDevice::CUDA);
