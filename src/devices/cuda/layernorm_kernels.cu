@@ -1,6 +1,3 @@
-#include <torch/all.h>
-#include <torch/extension.h>
-
 #include <cub/cub.cuh>
 #include <algorithm>
 #include <cstdint>
@@ -31,8 +28,9 @@
             __VA_ARGS__();                                                           \
             break;                                                                   \
         }                                                                            \
-        default:                                                                     \
-            TORCH_CHECK(false, "Expects rank 2, 3 or 4 tensors but got ", NUM_DIMS); \
+        default: {                                                                   \
+            return false;                                                            \
+        }                                                                            \
     }
 
 #define FASTLLM_DISPATCH_VEC_SIZE(VEC_SIZE, ...) \
@@ -295,9 +293,9 @@ bool rms_norm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &
 
 bool fused_add_rms_norm( // [hidden_size]
     fastllm::Data &input, fastllm::Data &residual, const fastllm::Data &weight, double epsilon) {
-    TORCH_CHECK(weight.dataType == input.dataType);
-    TORCH_CHECK(input.dataType == residual.dataType);
-    TORCH_CHECK(residual.Count(0) == input.Count(0));
+    if (weight.dataType != input.dataType || input.dataType != residual.dataType || residual.Count(0) != input.Count(0)) {
+        return false;
+    }
 
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     float *cudaResidual = (float *)FastllmCudaPrepareInput(residual);
