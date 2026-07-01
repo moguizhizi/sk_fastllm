@@ -119,6 +119,11 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
     (void)outChannels;
     return false;
 #else
+    if (std::getenv("FASTLLM_DISABLE_VLLM_AWQ_GEMM") != nullptr) {
+        FastllmVllmKernelTraceSkip("disabled by FASTLLM_DISABLE_VLLM_AWQ_GEMM",
+                                   numTokens, inChannels, outChannels, weight.groupCnt);
+        return false;
+    }
     if (input.dataType != fastllm::DataType::FLOAT16) {
         FastllmVllmKernelTraceSkip("input is not FLOAT16", numTokens, inChannels, outChannels, weight.groupCnt);
         return false;
