@@ -175,6 +175,7 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
         cudaInput, (const uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaBias,
         cudaOutput, numTokens, inChannels, outChannels, weight.groupCnt, weight.group);
     checkCudaErrors("Error: CUDA error when launching vLLM-inspired AWQ GEMM!", cudaGetLastError());
+    FastllmCudaFinishOutput(output, cudaOutput);
     FastllmVllmKernelTraceHit("done", numTokens, inChannels, outChannels,
                               weight.groupCnt, weight.group, !bias.dims.empty());
     return true;
