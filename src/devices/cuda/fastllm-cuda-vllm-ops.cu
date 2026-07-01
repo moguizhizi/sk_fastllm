@@ -1304,7 +1304,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
     float bVal = __half2float(__hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-bHalfRaw))));
 #endif
     float aRaw = __half2float(baRow[numVHeads + head_idx]);
-    float gStored = __half2float(__float2half_rn(-exp((double)aLog[head_idx]) * softplus(aRaw + dtBias[head_idx])));
+    float gStored = __half2float(__float2half_rn(-exp((double)aLog[head_idx]) * FastllmVllmOpsSoftplus(aRaw + dtBias[head_idx])));
     float gVal = expf(gStored);
 
     half *last_recurrent_state = statePool != nullptr ?
