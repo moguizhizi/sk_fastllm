@@ -283,6 +283,1744 @@ void FastllmResetLogitsOfEOSAll(int batch, fastllm::Data *logits, const std::vec
     checkCudaErrors("Error: CUDA error when reset logits of EOS all!", cudaGetLastError());
 }
 
+template <typename T>
+__global__ void FastllmVllmOpsRecurrentGatedDeltaRuleKernel(
+    T *last_recurrent_state,
+    const T *g_t,
+    const T *k_t,
+    const T *v_t,
+    const T *b_t,
+    const T *q_t,
+    T *core_attn_out,
+    int n0, int n1, int n2, int n3, int group, float qScale) {
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    if (batch_idx >= n0 || head_idx >= n1) {
+        return;
+    }
+
+    int base_idx = batch_idx * n1 + head_idx;
+    int tid = threadIdx.x;
+
+    extern __shared__ float shared_mem[];
+    float *kv_mem = shared_mem;
+    float *delta = &shared_mem[n3];
+
+    float g_val = expf((float)g_t[base_idx]);
+    for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
+        int state_idx = base_idx * n2 * n3 + idx;
+        last_recurrent_state[state_idx] = (T)((float)last_recurrent_state[state_idx] * g_val);
+    }
+    __syncthreads();
+
+    if (tid < n3) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float k_val = (float)k_t[base_idx / group * n2 + j];
+            int state_idx = base_idx * n2 * n3 + j * n3 + tid;
+            sum += (float)last_recurrent_state[state_idx] * k_val;
+        }
+        kv_mem[tid] = sum;
+    }
+    __syncthreads();
+
+    float b_val = (float)b_t[base_idx];
+    if (tid < n3) {
+        float v_val = (float)v_t[base_idx * n3 + tid];
+        delta[tid] = (v_val - kv_mem[tid]) * b_val;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
+        int j = idx / n3;
+        int k = idx % n3;
+        float k_val = (float)k_t[base_idx / group * n2 + j];
+        int state_idx = base_idx * n2 * n3 + idx;
+        last_recurrent_state[state_idx] = (T)((float)last_recurrent_state[state_idx] + k_val * delta[k]);
+    }
+    __syncthreads();
+
+    if (tid < n3) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float q_val = FastllmVllmOpsValueToFloat(q_t[base_idx / group * n2 + j]);
+            if (qScale != 1.0f) {
+                if constexpr (std::is_same_v<T, float>) {
+                    q_val *= qScale;
+                } else if constexpr (std::is_same_v<T, half>) {
+                    half qScaleHalf = __float2half_rn(qScale);
+#ifdef CUDA_NO_TENSOR_CORE
+                    q_val = __half2float(__float2half(__half2float(q_t[base_idx / group * n2 + j]) * __half2float(qScaleHalf)));
+#else
+                    q_val = __half2float(__hmul(q_t[base_idx / group * n2 + j], qScaleHalf));
+#endif
+                } else {
+                    q_val = FastllmVllmOpsValueToFloat(FastllmVllmOpsFloatToValue<T>(q_val * qScale));
+                }
+            }
+            int state_idx = base_idx * n2 * n3 + j * n3 + tid;
+            sum += (float)last_recurrent_state[state_idx] * q_val;
+        }
+        core_attn_out[base_idx * n3 + tid] = (T)sum;
+    }
+}
+
+template <int TILE_V>
+__global__ void FastllmVllmOpsRecurrentGatedDeltaRuleHalfTileKernel(
+    half *last_recurrent_state,
+    const half *g_t,
+    const half *k_t,
+    const half *v_t,
+    const half *b_t,
+    const half *q_t,
+    half *core_attn_out,
+    int n0, int n1, int n2, int n3, int group, float qScale) {
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int v_base = blockIdx.z * TILE_V;
+    if (batch_idx >= n0 || head_idx >= n1 || v_base >= n3) {
+        return;
+    }
+
+    int tile_v = n3 - v_base;
+    if (tile_v > TILE_V) {
+        tile_v = TILE_V;
+    }
+
+    int tid = threadIdx.x;
+    int base_idx = batch_idx * n1 + head_idx;
+    int kv_heads = n1 / group;
+    int qk_base = (batch_idx * kv_heads + head_idx / group) * n2;
+    int state_base = base_idx * n2 * n3;
+    int out_base = base_idx * n3 + v_base;
+
+    extern __shared__ float shared_mem[];
+    float *state_tile = shared_mem;
+    float *delta = state_tile + n2 * tile_v;
+
+    float g_val = expf(__half2float(g_t[base_idx]));
+    for (int idx = tid; idx < n2 * tile_v; idx += blockDim.x) {
+        int j = idx / tile_v;
+        int tv = idx - j * tile_v;
+        int state_idx = state_base + j * n3 + v_base + tv;
+        float scaled = __half2float(__float2half_rn(__half2float(last_recurrent_state[state_idx]) * g_val));
+        state_tile[idx] = scaled;
+    }
+    __syncthreads();
+
+    float b_val = __half2float(b_t[base_idx]);
+    if (tid < tile_v) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float k_val = __half2float(k_t[qk_base + j]);
+            sum += state_tile[j * tile_v + tid] * k_val;
+        }
+        float v_val = __half2float(v_t[out_base + tid]);
+        delta[tid] = (v_val - sum) * b_val;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n2 * tile_v; idx += blockDim.x) {
+        int j = idx / tile_v;
+        int tv = idx - j * tile_v;
+        float k_val = __half2float(k_t[qk_base + j]);
+        float updated = __half2float(__float2half_rn(state_tile[idx] + k_val * delta[tv]));
+        state_tile[idx] = updated;
+        int state_idx = state_base + j * n3 + v_base + tv;
+        last_recurrent_state[state_idx] = __float2half_rn(updated);
+    }
+    __syncthreads();
+
+    if (tid < tile_v) {
+        float sum = 0.0f;
+        half qScaleHalf = __float2half_rn(qScale);
+        for (int j = 0; j < n2; j++) {
+            float q_val;
+            if (qScale != 1.0f) {
+#ifdef CUDA_NO_TENSOR_CORE
+                q_val = __half2float(__float2half(__half2float(q_t[qk_base + j]) * __half2float(qScaleHalf)));
+#else
+                q_val = __half2float(__hmul(q_t[qk_base + j], qScaleHalf));
+#endif
+            } else {
+                q_val = __half2float(q_t[qk_base + j]);
+            }
+            sum += state_tile[j * tile_v + tid] * q_val;
+        }
+        core_attn_out[out_base + tid] = __float2half_rn(sum);
+    }
+}
+
+void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b,
+                                    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float qScale) {
+    int n0 = last_recurrent_state.dims[0];
+    int n1 = last_recurrent_state.dims[1];
+    int n2 = last_recurrent_state.dims[2];
+    int n3 = last_recurrent_state.dims[3];
+
+    float *d_last_state = (float *)last_recurrent_state.cudaData;
+    float *d_g = (float *)g.cudaData;
+    float *d_k = (float *)k.cudaData;
+    float *d_v = (float *)v.cudaData;
+    float *d_b = (float *)b.cudaData;
+    float *d_q = (float *)q.cudaData;
+    float *d_out = (float *)core_attn_out.cudaData;
+
+    int group = v.dims[1] / q.dims[1];
+    dim3 gridDim(n0, n1);
+    int threadsPerBlock = std::min(256, std::max(n2 * n3, n3));
+    size_t sharedMemSize = 2 * n3 * sizeof(float);
+
+    if (q.dataType == fastllm::DataType::FLOAT32) {
+        FastllmVllmOpsRecurrentGatedDeltaRuleKernel<float><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+            d_last_state, d_g, d_k, d_v, d_b, d_q, d_out, n0, n1, n2, n3, group, qScale);
+    } else if (q.dataType == fastllm::DataType::FLOAT16) {
+        constexpr int tileV = 8;
+        size_t tileSharedMemSize = ((size_t)n2 * tileV + tileV) * sizeof(float);
+        if (n2 > 0 && n3 > 0 && tileSharedMemSize <= 48 * 1024) {
+            dim3 tileGrid(n0, n1, (n3 + tileV - 1) / tileV);
+            int tileThreads = 256;
+            FastllmVllmOpsRecurrentGatedDeltaRuleHalfTileKernel<tileV><<<tileGrid, tileThreads, tileSharedMemSize>>>(
+                (half *)d_last_state, (half *)d_g, (half *)d_k, (half *)d_v, (half *)d_b, (half *)d_q, (half *)d_out,
+                n0, n1, n2, n3, group, qScale);
+        } else {
+            FastllmVllmOpsRecurrentGatedDeltaRuleKernel<half><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+                (half *)d_last_state, (half *)d_g, (half *)d_k, (half *)d_v, (half *)d_b, (half *)d_q, (half *)d_out,
+                n0, n1, n2, n3, group, qScale);
+        }
+    }
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRule.", cudaGetLastError());
+}
+
+template <typename T>
+__global__ void FastllmRecurrentGatedDeltaRuleBatchPointerKernel(
+    T** last_recurrent_states, // batch pointers, each [1, n1, n2, n3]
+    const T* g_t,              // [batch, n1]
+    const T* k_t,              // [batch, n1 / group, n2]
+    const T* v_t,              // [batch, n1, n3]
+    const T* b_t,              // [batch, n1]
+    const T* q_t,              // [batch, n1 / group, n2]
+    T* core_attn_out,          // [batch, n1, n3]
+    int batch, int n1, int n2, int n3, int group, float qScale)
+{
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+
+    if (batch_idx >= batch || head_idx >= n1) return;
+
+    T* last_recurrent_state = last_recurrent_states[batch_idx];
+    int base_idx = batch_idx * n1 + head_idx;
+    int state_head_base = head_idx * n2 * n3;
+    int tid = threadIdx.x;
+
+    extern __shared__ float shared_mem[];
+    float* kv_mem = shared_mem;
+    float* delta = &shared_mem[n3];
+
+    float g_val = expf((float)g_t[base_idx]);
+
+    for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
+        int state_idx = state_head_base + idx;
+        last_recurrent_state[state_idx] = (T)((float)last_recurrent_state[state_idx] * g_val);
+    }
+    __syncthreads();
+
+    if (tid < n3) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float k_val = (float)k_t[base_idx / group * n2 + j];
+            int state_idx = state_head_base + j * n3 + tid;
+            sum += (float)last_recurrent_state[state_idx] * k_val;
+        }
+        kv_mem[tid] = sum;
+    }
+    __syncthreads();
+
+    float b_val = (float)b_t[base_idx];
+    if (tid < n3) {
+        float v_val = (float)v_t[base_idx * n3 + tid];
+        delta[tid] = (v_val - kv_mem[tid]) * b_val;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
+        int j = idx / n3;
+        int k = idx % n3;
+        float k_val = (float)k_t[base_idx / group * n2 + j];
+        int state_idx = state_head_base + idx;
+        last_recurrent_state[state_idx] = (T)((float)last_recurrent_state[state_idx] + k_val * delta[k]);
+    }
+    __syncthreads();
+
+    if (tid < n3) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float q_val = FastllmVllmOpsValueToFloat(q_t[base_idx / group * n2 + j]);
+            if (qScale != 1.0f) {
+                if constexpr (std::is_same_v<T, float>) {
+                    q_val *= qScale;
+                } else if constexpr (std::is_same_v<T, half>) {
+                    half qScaleHalf = __float2half_rn(qScale);
+#ifdef CUDA_NO_TENSOR_CORE
+                    q_val = __half2float(__float2half(__half2float(q_t[base_idx / group * n2 + j]) * __half2float(qScaleHalf)));
+#else
+                    q_val = __half2float(__hmul(q_t[base_idx / group * n2 + j], qScaleHalf));
+#endif
+                } else {
+                    q_val = FastllmVllmOpsValueToFloat(FastllmVllmOpsFloatToValue<T>(q_val * qScale));
+                }
+            }
+            int state_idx = state_head_base + j * n3 + tid;
+            sum += (float)last_recurrent_state[state_idx] * q_val;
+        }
+        core_attn_out[base_idx * n3 + tid] = (T)sum;
+    }
+}
+
+__global__ void FastllmLinearAttentionStateTransposeHalfKernel(
+    const half *input, half *output, size_t totalHeads, int kdim, int vdim, bool kvToVk) {
+    size_t stride = (size_t)kdim * vdim;
+    size_t total = totalHeads * stride;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        size_t head = idx / stride;
+        size_t rem = idx - head * stride;
+        if (kvToVk) {
+            int k = rem / vdim;
+            int v = rem - (size_t)k * vdim;
+            output[head * stride + (size_t)v * kdim + k] = input[idx];
+        } else {
+            int v = rem / kdim;
+            int k = rem - (size_t)v * kdim;
+            output[head * stride + (size_t)k * vdim + v] = input[idx];
+        }
+    }
+}
+
+template <int TILE_V>
+__global__ void FastllmRecurrentGatedDeltaRuleNormBaTransposedHalfWarpKernel(
+    half* last_recurrent_state,  // physical [n0, n1, n3, n2], logical [n0, n1, n2, n3]
+    const half* a_t,             // [n0, n1]
+    const half* b_t,             // [n0, n1]
+    const half* k_t,             // [n0, n1 / group, n2], unnormalized
+    const half* v_t,             // [n0, n1, n3]
+    const half* q_t,             // [n0, n1 / group, n2], unnormalized
+    const float* norm_weight,    // [n2]
+    const float* a_log,          // [n1]
+    const float* dt_bias,        // [n1]
+    half* core_attn_out,         // [n0, n1, n3]
+    int n0, int n1, int n2, int n3, int group, float eps, float qScale)
+{
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int v_base = blockIdx.z * TILE_V;
+    if (batch_idx >= n0 || head_idx >= n1 || v_base >= n3) return;
+
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    int base_idx = batch_idx * n1 + head_idx;
+    int kv_heads = n1 / group;
+    int qk_base = (batch_idx * kv_heads + head_idx / group) * n2;
+    int state_base = base_idx * n2 * n3;
+    int out_base = base_idx * n3;
+
+    extern __shared__ char shared_buf[];
+    float *q_norm = reinterpret_cast<float*>(shared_buf);
+    float *k_norm = q_norm + n2;
+    float *warp_q = k_norm + n2;
+    float *warp_k = warp_q + 2;
+    float *scales = warp_k + 2;
+    float *ba_values = scales + 2;
+
+    if (tid < 64) {
+        int norm_warp = tid >> 5;
+        const half2 *q_h2 = reinterpret_cast<const half2*>(q_t + qk_base);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(k_t + qk_base);
+        half2 qh = q_h2[tid];
+        half2 kh = k_h2[tid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+        }
+        if (lane_id == 0) {
+            warp_q[norm_warp] = q_sum2;
+            warp_k[norm_warp] = k_sum2;
+        }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        float q_val = tid < 2 ? warp_q[tid] : 0.0f;
+        float k_val = tid < 2 ? warp_k[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+        }
+        if (tid == 0) {
+            scales[0] = rsqrtf(q_val / n2 + eps);
+            scales[1] = rsqrtf(k_val / n2 + eps);
+        }
+    }
+    __syncthreads();
+
+    if (tid < 64) {
+        const half2 *q_h2 = reinterpret_cast<const half2*>(q_t + qk_base);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(k_t + qk_base);
+        half2 qh = q_h2[tid];
+        half2 kh = k_h2[tid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float w0 = __ldg(&norm_weight[tid * 2]);
+        float w1 = __ldg(&norm_weight[tid * 2 + 1]);
+        q_norm[tid * 2] = qf.x * scales[0] * w0;
+        q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
+        k_norm[tid * 2] = kf.x * scales[1] * w0;
+        k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
+    }
+
+    if (tid == 0) {
+        float b_raw = __half2float(b_t[base_idx]);
+        float g_raw = -__expf(a_log[head_idx]) *
+                      FastllmVllmOpsSoftplus(__half2float(a_t[base_idx]) + dt_bias[head_idx]);
+        ba_values[0] = 1.0f / (1.0f + __expf(-b_raw));
+        ba_values[1] = __expf(g_raw);
+    }
+    __syncthreads();
+
+    int v_col = v_base + warp_id;
+    if (warp_id >= TILE_V || v_col >= n3) {
+        return;
+    }
+
+    half *state_row = last_recurrent_state + state_base + (size_t)v_col * n2;
+    float g_val = ba_values[1];
+    float sum_k = 0.0f;
+    for (int j = lane_id; j < n2; j += 32) {
+        sum_k += (__half2float(state_row[j]) * g_val) * k_norm[j];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_k += __shfl_down_sync(0xffffffff, sum_k, offset);
+    }
+    float delta = (FastllmVllmOpsValueToFloat(v_t[out_base + v_col]) - __shfl_sync(0xffffffff, sum_k, 0)) * ba_values[0];
+
+    float sum_q = 0.0f;
+    for (int j = lane_id; j < n2; j += 32) {
+        float updated = __half2float(state_row[j]) * g_val + k_norm[j] * delta;
+        state_row[j] = __float2half_rn(updated);
+        sum_q += updated * (q_norm[j] * qScale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_q += __shfl_down_sync(0xffffffff, sum_q, offset);
+    }
+    if (lane_id == 0) {
+        core_attn_out[out_base + v_col] = __float2half_rn(sum_q);
+    }
+}
+
+template <int TILE_V>
+__global__ void FastllmRecurrentGatedDeltaRuleNormTransposedHalfWarpKernel(
+    half* last_recurrent_state,  // physical [n0, n1, n3, n2], logical [n0, n1, n2, n3]
+    const half* g_t,             // [n0, n1]
+    const half* k_t,             // [n0, n1 / group, n2], unnormalized
+    const half* v_t,             // [n0, n1, n3]
+    const half* b_t,             // [n0, n1]
+    const half* q_t,             // [n0, n1 / group, n2], unnormalized
+    const float* norm_weight,    // [n2]
+    half* core_attn_out,         // [n0, n1, n3]
+    int n0, int n1, int n2, int n3, int group, float eps, float qScale)
+{
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int v_base = blockIdx.z * TILE_V;
+    if (batch_idx >= n0 || head_idx >= n1 || v_base >= n3) return;
+
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    int base_idx = batch_idx * n1 + head_idx;
+    int kv_heads = n1 / group;
+    int qk_base = (batch_idx * kv_heads + head_idx / group) * n2;
+    int state_base = base_idx * n2 * n3;
+    int out_base = base_idx * n3;
+
+    extern __shared__ char shared_buf[];
+    float *q_norm = reinterpret_cast<float*>(shared_buf);
+    float *k_norm = q_norm + n2;
+    float *warp_q = k_norm + n2;
+    float *warp_k = warp_q + 2;
+    float *scales = warp_k + 2;
+
+    if (tid < 64) {
+        int norm_warp = tid >> 5;
+        const half2 *q_h2 = reinterpret_cast<const half2*>(q_t + qk_base);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(k_t + qk_base);
+        half2 qh = q_h2[tid];
+        half2 kh = k_h2[tid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+        }
+        if (lane_id == 0) {
+            warp_q[norm_warp] = q_sum2;
+            warp_k[norm_warp] = k_sum2;
+        }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        float q_val = tid < 2 ? warp_q[tid] : 0.0f;
+        float k_val = tid < 2 ? warp_k[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+        }
+        if (tid == 0) {
+            scales[0] = rsqrtf(q_val / n2 + eps);
+            scales[1] = rsqrtf(k_val / n2 + eps);
+        }
+    }
+    __syncthreads();
+
+    if (tid < 64) {
+        const half2 *q_h2 = reinterpret_cast<const half2*>(q_t + qk_base);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(k_t + qk_base);
+        half2 qh = q_h2[tid];
+        half2 kh = k_h2[tid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float w0 = __ldg(&norm_weight[tid * 2]);
+        float w1 = __ldg(&norm_weight[tid * 2 + 1]);
+        q_norm[tid * 2] = qf.x * scales[0] * w0;
+        q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
+        k_norm[tid * 2] = kf.x * scales[1] * w0;
+        k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
+    }
+    __syncthreads();
+
+    int v_col = v_base + warp_id;
+    if (warp_id >= TILE_V || v_col >= n3) {
+        return;
+    }
+
+    half *state_row = last_recurrent_state + state_base + (size_t)v_col * n2;
+    float g_val = expf(__half2float(g_t[base_idx]));
+    float sum_k = 0.0f;
+    for (int j = lane_id; j < n2; j += 32) {
+        sum_k += (__half2float(state_row[j]) * g_val) * k_norm[j];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_k += __shfl_down_sync(0xffffffff, sum_k, offset);
+    }
+    float delta = (FastllmVllmOpsValueToFloat(v_t[out_base + v_col]) - __shfl_sync(0xffffffff, sum_k, 0)) *
+                  __half2float(b_t[base_idx]);
+
+    float sum_q = 0.0f;
+    for (int j = lane_id; j < n2; j += 32) {
+        float updated = __half2float(state_row[j]) * g_val + k_norm[j] * delta;
+        state_row[j] = __float2half_rn(updated);
+        sum_q += updated * (q_norm[j] * qScale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_q += __shfl_down_sync(0xffffffff, sum_q, offset);
+    }
+    if (lane_id == 0) {
+        core_attn_out[out_base + v_col] = __float2half_rn(sum_q);
+    }
+}
+
+template <int TILE_V>
+__global__ void FastllmRecurrentGatedDeltaRuleBatchPointerHalfTileKernel(
+    half** last_recurrent_states, // batch pointers, each [1, n1, n2, n3]
+    const half* g_t,              // [batch, n1]
+    const half* k_t,              // [batch, n1 / group, n2]
+    const half* v_t,              // [batch, n1, n3]
+    const half* b_t,              // [batch, n1]
+    const half* q_t,              // [batch, n1 / group, n2]
+    half* core_attn_out,          // [batch, n1, n3]
+    int batch, int n1, int n2, int n3, int group, float qScale)
+{
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int v_base = blockIdx.z * TILE_V;
+    if (batch_idx >= batch || head_idx >= n1 || v_base >= n3) return;
+
+    int tile_v = n3 - v_base;
+    if (tile_v > TILE_V) {
+        tile_v = TILE_V;
+    }
+
+    int tid = threadIdx.x;
+    int base_idx = batch_idx * n1 + head_idx;
+    int kv_heads = n1 / group;
+    int qk_base = (batch_idx * kv_heads + head_idx / group) * n2;
+    int state_head_base = head_idx * n2 * n3;
+    int out_base = base_idx * n3 + v_base;
+    half *last_recurrent_state = last_recurrent_states[batch_idx];
+
+    extern __shared__ float shared_mem[];
+    float *state_tile = shared_mem;
+    float *delta = state_tile + n2 * tile_v;
+
+    float g_val = expf(__half2float(g_t[base_idx]));
+
+    for (int idx = tid; idx < n2 * tile_v; idx += blockDim.x) {
+        int j = idx / tile_v;
+        int tv = idx - j * tile_v;
+        int state_idx = state_head_base + j * n3 + v_base + tv;
+        float scaled = __half2float(__float2half_rn(__half2float(last_recurrent_state[state_idx]) * g_val));
+        state_tile[idx] = scaled;
+    }
+    __syncthreads();
+
+    float b_val = __half2float(b_t[base_idx]);
+    if (tid < tile_v) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float k_val = __half2float(k_t[qk_base + j]);
+            sum += state_tile[j * tile_v + tid] * k_val;
+        }
+        float v_val = __half2float(v_t[out_base + tid]);
+        delta[tid] = (v_val - sum) * b_val;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n2 * tile_v; idx += blockDim.x) {
+        int j = idx / tile_v;
+        int tv = idx - j * tile_v;
+        float k_val = __half2float(k_t[qk_base + j]);
+        float updated = __half2float(__float2half_rn(state_tile[idx] + k_val * delta[tv]));
+        state_tile[idx] = updated;
+        int state_idx = state_head_base + j * n3 + v_base + tv;
+        last_recurrent_state[state_idx] = __float2half_rn(updated);
+    }
+    __syncthreads();
+
+    if (tid < tile_v) {
+        float sum = 0.0f;
+        half qScaleHalf = __float2half_rn(qScale);
+        for (int j = 0; j < n2; j++) {
+            float q_val;
+            if (qScale != 1.0f) {
+#ifdef CUDA_NO_TENSOR_CORE
+                q_val = __half2float(__float2half(__half2float(q_t[qk_base + j]) * __half2float(qScaleHalf)));
+#else
+                q_val = __half2float(__hmul(q_t[qk_base + j], qScaleHalf));
+#endif
+            } else {
+                q_val = __half2float(q_t[qk_base + j]);
+            }
+            sum += state_tile[j * tile_v + tid] * q_val;
+        }
+        core_attn_out[out_base + tid] = __float2half_rn(sum);
+    }
+}
+
+
+static bool FastllmLinearAttentionStateTransposeFloat16(fastllm::Data &last_recurrent_state, bool kvToVk) {
+    if (last_recurrent_state.isFake ||
+        last_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        last_recurrent_state.cudaData == nullptr ||
+        last_recurrent_state.dims.size() != 4 ||
+        last_recurrent_state.dims[0] <= 0 ||
+        last_recurrent_state.dims[1] <= 0 ||
+        last_recurrent_state.dims[2] <= 0 ||
+        last_recurrent_state.dims[3] <= 0) {
+        return false;
+    }
+
+    int n0 = last_recurrent_state.dims[0];
+    int n1 = last_recurrent_state.dims[1];
+    int n2 = last_recurrent_state.dims[2];
+    int n3 = last_recurrent_state.dims[3];
+    size_t totalHeads = (size_t)n0 * n1;
+    size_t total = totalHeads * n2 * n3;
+    size_t bytes = last_recurrent_state.GetBytes();
+    void *oldData = last_recurrent_state.cudaData;
+    bool oldBorrowed = last_recurrent_state.cudaDataBorrowed;
+    void *newData = last_recurrent_state.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
+    if (newData == nullptr) {
+        return false;
+    }
+
+    int threads = 256;
+    int blocks = (int)std::min<size_t>((total + threads - 1) / threads, 65535);
+    FastllmLinearAttentionStateTransposeHalfKernel<<<blocks, threads>>>(
+        (const half*)oldData, (half*)newData, totalHeads, n2, n3, kvToVk
+    );
+    checkCudaErrors("Error: CUDA error in FastllmLinearAttentionStateTransposeFloat16.", cudaGetLastError());
+
+    if (!oldBorrowed) {
+        if (last_recurrent_state.directMemory) {
+            FastllmCudaDirectFree(oldData);
+        } else {
+            FastllmCudaFree(oldData);
+        }
+    } else if (last_recurrent_state.isPagedKVCache &&
+               last_recurrent_state.pagedKVCacheData != nullptr &&
+               !last_recurrent_state.pageIndex.empty()) {
+        last_recurrent_state.pagedKVCacheData->ReleasePageIndices(last_recurrent_state.pageIndex);
+        last_recurrent_state.pageIndex.clear();
+        last_recurrent_state.pagedKVCacheData = nullptr;
+        last_recurrent_state.isPagedKVCache = false;
+    }
+    last_recurrent_state.cudaData = newData;
+    last_recurrent_state.cudaDataBorrowed = false;
+    return true;
+}
+
+bool FastllmLinearAttentionStateTransposeKVToVKFloat16(fastllm::Data &last_recurrent_state) {
+    return FastllmLinearAttentionStateTransposeFloat16(last_recurrent_state, true);
+}
+
+bool FastllmLinearAttentionStateTransposeVKToKVFloat16(fastllm::Data &last_recurrent_state) {
+    return FastllmLinearAttentionStateTransposeFloat16(last_recurrent_state, false);
+}
+
+bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale) {
+    if (q.dataDevice != fastllm::DataDevice::CUDA ||
+        k.dataDevice != fastllm::DataDevice::CUDA ||
+        v.dataDevice != fastllm::DataDevice::CUDA ||
+        g.dataDevice != fastllm::DataDevice::CUDA ||
+        b.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        last_recurrent_state.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    if (q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        b.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16) {
+        return false;
+    }
+    if (last_recurrent_state.dims.size() != 4 ||
+        q.dims.size() != 4 || k.dims.size() != 4 || v.dims.size() != 4 ||
+        g.dims.size() != 3 || b.dims.size() != 3 ||
+        normWeight.dims.size() != 1) {
+        return false;
+    }
+
+    int n0 = last_recurrent_state.dims[0];
+    int n1 = last_recurrent_state.dims[1];
+    int n2 = last_recurrent_state.dims[2];
+    int n3 = last_recurrent_state.dims[3];
+    if (n0 <= 0 || n1 <= 0 || n2 != 128 || n3 <= 0 ||
+        normWeight.dims[0] != n2 ||
+        q.dims[0] != n0 || k.dims[0] != n0 || v.dims[0] != n0 ||
+        q.dims[2] != 1 || k.dims[2] != 1 || v.dims[2] != 1 ||
+        q.dims[3] != n2 || k.dims[3] != n2 || v.dims[3] != n3 ||
+        v.dims[1] != n1 ||
+        g.dims[0] != n0 || b.dims[0] != n0 ||
+        g.dims[1] != n1 || b.dims[1] != n1 ||
+        g.dims[2] != 1 || b.dims[2] != 1 ||
+        q.dims[1] <= 0 || q.dims[1] != k.dims[1] ||
+        n1 % q.dims[1] != 0) {
+        return false;
+    }
+
+    int group = n1 / q.dims[1];
+    constexpr int tileV = 8;
+    size_t sharedMemSize = (2 * (size_t)n2 + 8) * sizeof(float);
+    if (sharedMemSize > 48 * 1024) {
+        return false;
+    }
+
+    core_attn_out.dataType = last_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = last_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({n0, n1, 1, n3});
+    core_attn_out.Allocate(false);
+
+    dim3 grid(n0, n1, (n3 + tileV - 1) / tileV);
+    FastllmRecurrentGatedDeltaRuleNormTransposedHalfWarpKernel<tileV><<<grid, tileV * 32, sharedMemSize>>>(
+        (half*)last_recurrent_state.cudaData,
+        (half*)g.cudaData,
+        (half*)k.cudaData,
+        (half*)v.cudaData,
+        (half*)b.cudaData,
+        (half*)q.cudaData,
+        (float*)normWeight.cudaData,
+        (half*)core_attn_out.cudaData,
+        n0, n1, n2, n3, group, eps, qScale
+    );
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleNormTransposedFloat16.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale) {
+    if (q.dataDevice != fastllm::DataDevice::CUDA ||
+        k.dataDevice != fastllm::DataDevice::CUDA ||
+        v.dataDevice != fastllm::DataDevice::CUDA ||
+        a.dataDevice != fastllm::DataDevice::CUDA ||
+        b.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        aLog.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
+        last_recurrent_state.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    if (q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        a.dataType != fastllm::DataType::FLOAT16 ||
+        b.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16) {
+        return false;
+    }
+    if (last_recurrent_state.dims.size() != 4 ||
+        q.dims.size() != 4 || k.dims.size() != 4 || v.dims.size() != 4 ||
+        a.dims.size() != 3 || b.dims.size() != 3 ||
+        normWeight.dims.size() != 1 ||
+        aLog.dims.size() != 1 ||
+        dtBias.dims.size() != 1) {
+        return false;
+    }
+
+    int n0 = last_recurrent_state.dims[0];
+    int n1 = last_recurrent_state.dims[1];
+    int n2 = last_recurrent_state.dims[2];
+    int n3 = last_recurrent_state.dims[3];
+    if (n0 <= 0 || n1 <= 0 || n2 != 128 || n3 <= 0 ||
+        normWeight.dims[0] != n2 ||
+        aLog.dims[0] != n1 ||
+        dtBias.dims[0] != n1 ||
+        q.dims[0] != n0 || k.dims[0] != n0 || v.dims[0] != n0 ||
+        q.dims[2] != 1 || k.dims[2] != 1 || v.dims[2] != 1 ||
+        q.dims[3] != n2 || k.dims[3] != n2 || v.dims[3] != n3 ||
+        v.dims[1] != n1 ||
+        a.dims[0] != n0 || b.dims[0] != n0 ||
+        a.dims[1] != n1 || b.dims[1] != n1 ||
+        a.dims[2] != 1 || b.dims[2] != 1 ||
+        q.dims[1] <= 0 || q.dims[1] != k.dims[1] ||
+        n1 % q.dims[1] != 0) {
+        return false;
+    }
+
+    int group = n1 / q.dims[1];
+    constexpr int tileV = 8;
+    size_t sharedMemSize = (2 * (size_t)n2 + 10) * sizeof(float);
+    if (sharedMemSize > 48 * 1024) {
+        return false;
+    }
+
+    core_attn_out.dataType = last_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = last_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({n0, n1, 1, n3});
+    core_attn_out.Allocate(false);
+
+    dim3 grid(n0, n1, (n3 + tileV - 1) / tileV);
+    FastllmRecurrentGatedDeltaRuleNormBaTransposedHalfWarpKernel<tileV><<<grid, tileV * 32, sharedMemSize>>>(
+        (half*)last_recurrent_state.cudaData,
+        (half*)a.cudaData,
+        (half*)b.cudaData,
+        (half*)k.cudaData,
+        (half*)v.cudaData,
+        (half*)q.cudaData,
+        (float*)normWeight.cudaData,
+        (float*)aLog.cudaData,
+        (float*)dtBias.cudaData,
+        (half*)core_attn_out.cudaData,
+        n0, n1, n2, n3, group, eps, qScale
+    );
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b,
+    fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
+    fastllm::Data &core_attn_out, float qScale) {
+    if (cudaStatePointers == nullptr || batch <= 0 ||
+        first_recurrent_state.dims.size() != 4 ||
+        first_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+        first_recurrent_state.cudaData == nullptr) {
+        return false;
+    }
+    int n1 = first_recurrent_state.dims[1];
+    int n2 = first_recurrent_state.dims[2];
+    int n3 = first_recurrent_state.dims[3];
+    if (q.dims.size() != 4 || k.dims.size() != 4 || v.dims.size() != 4 ||
+        g.dims.size() != 3 || b.dims.size() != 3 ||
+        q.dims[0] != batch || k.dims[0] != batch || v.dims[0] != batch ||
+        g.dims[0] != batch || b.dims[0] != batch ||
+        q.dims[2] != 1 || k.dims[2] != 1 || v.dims[2] != 1 ||
+        g.dims[2] != 1 || b.dims[2] != 1 ||
+        v.dims[1] != n1 || g.dims[1] != n1 || b.dims[1] != n1 ||
+        q.dims[3] != n2 || k.dims[3] != n2 || v.dims[3] != n3 ||
+        q.dims[1] <= 0 || q.dims[1] != k.dims[1] || n1 % q.dims[1] != 0) {
+        return false;
+    }
+    int group = v.dims[1] / q.dims[1];
+
+    core_attn_out.dataType = first_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = first_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({batch, n1, 1, n3});
+    core_attn_out.Allocate(false);
+
+    dim3 gridDim(batch, n1);
+    int threadsPerBlock = std::min(256, std::max(n2 * n3, n3));
+    size_t sharedMemSize = 2 * n3 * sizeof(float);
+
+    if (q.dataType == fastllm::DataType::FLOAT32) {
+        FastllmRecurrentGatedDeltaRuleBatchPointerKernel<float><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+            (float**)cudaStatePointers, (float*)g.cudaData, (float*)k.cudaData, (float*)v.cudaData,
+            (float*)b.cudaData, (float*)q.cudaData, (float*)core_attn_out.cudaData,
+            batch, n1, n2, n3, group, qScale
+        );
+    } else if (q.dataType == fastllm::DataType::FLOAT16) {
+        constexpr int tileV = 8;
+        size_t tileSharedMemSize = ((size_t)n2 * tileV + tileV) * sizeof(float);
+        if (n2 > 0 && n3 > 0 && tileSharedMemSize <= 48 * 1024) {
+            dim3 tileGrid(batch, n1, (n3 + tileV - 1) / tileV);
+            int tileThreads = 256;
+            FastllmRecurrentGatedDeltaRuleBatchPointerHalfTileKernel<tileV><<<tileGrid, tileThreads, tileSharedMemSize>>>(
+                (half**)cudaStatePointers, (half*)g.cudaData, (half*)k.cudaData, (half*)v.cudaData,
+                (half*)b.cudaData, (half*)q.cudaData, (half*)core_attn_out.cudaData,
+                batch, n1, n2, n3, group, qScale
+            );
+        } else {
+            FastllmRecurrentGatedDeltaRuleBatchPointerKernel<half><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+                (half**)cudaStatePointers, (half*)g.cudaData, (half*)k.cudaData, (half*)v.cudaData,
+                (half*)b.cudaData, (half*)q.cudaData, (half*)core_attn_out.cudaData,
+                batch, n1, n2, n3, group, qScale
+            );
+        }
+    } else {
+        return false;
+    }
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchDevicePointers.", cudaGetLastError());
+    return true;
+}
+
+void FastllmRecurrentGatedDeltaRuleBatch(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out, float qScale) {
+    int batch = (int)last_recurrent_states.size();
+    void **cpuPointers = new void*[batch];
+    for (int i = 0; i < batch; i++) {
+        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+    }
+    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
+    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
+    delete[] cpuPointers;
+    checkCudaErrors("Error: CUDA error when copy recurrent state pointers to GPU!", state);
+
+    FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
+        q, k, v, g, b, *last_recurrent_states[0], cudaPointers, batch, core_attn_out, qScale);
+    FastllmCudaFree(cudaPointers);
+}
+
+__global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
+    half **last_recurrent_states,
+    const half *convOutput,
+    const half *ba,
+    const float *normWeight,
+    const float *aLog,
+    const float *dtBias,
+    half *core_attn_out,
+    int batch, int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale,
+    half *statePool, const int *slotIds, int stateStride) {
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    if (batch_idx >= batch || head_idx >= numVHeads) return;
+
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int numWarps = (blockDim.x + 31) / 32;
+    int group = numVHeads / numKHeads;
+    int qHead = head_idx / group;
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    int convBase = batch_idx * qkvDim;
+    int qOffset = convBase + qHead * headKDim;
+    int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+    int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
+
+    extern __shared__ float shared_mem[];
+    float *kv_mem = shared_mem;
+    float *delta = kv_mem + headVDim;
+    float *warpQ = delta + headVDim;
+    float *warpK = warpQ + numWarps;
+    float *scales = warpK + numWarps;
+
+    float qSum2 = 0.0f;
+    float kSum2 = 0.0f;
+    for (int j = tid; j < headKDim; j += blockDim.x) {
+        float qx = __half2float(convOutput[qOffset + j]);
+        float kx = __half2float(convOutput[kOffset + j]);
+        qSum2 += qx * qx;
+        kSum2 += kx * kx;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum2 += __shfl_down_sync(0xffffffff, qSum2, offset);
+        kSum2 += __shfl_down_sync(0xffffffff, kSum2, offset);
+    }
+    if (lane_id == 0) {
+        warpQ[warp_id] = qSum2;
+        warpK[warp_id] = kSum2;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float qVal = lane_id < numWarps ? warpQ[lane_id] : 0.0f;
+        float kVal = lane_id < numWarps ? warpK[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            qVal += __shfl_down_sync(0xffffffff, qVal, offset);
+            kVal += __shfl_down_sync(0xffffffff, kVal, offset);
+        }
+        if (lane_id == 0) {
+            scales[0] = rsqrtf(qVal / headKDim + eps);
+            scales[1] = rsqrtf(kVal / headKDim + eps);
+        }
+    }
+    __syncthreads();
+    float qNormScale = scales[0];
+    float kNormScale = scales[1];
+
+    const half *baRow = ba + batch_idx * 2 * numVHeads;
+    float bRaw = __half2float(baRow[head_idx]);
+#ifdef CUDA_NO_TENSOR_CORE
+    float bVal = 1.0f / (1.0f + expf(-bRaw));
+#else
+    half bHalfRaw = baRow[head_idx];
+    float bVal = __half2float(__hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-bHalfRaw))));
+#endif
+    float aRaw = __half2float(baRow[numVHeads + head_idx]);
+    float gStored = __half2float(__float2half_rn(-exp((double)aLog[head_idx]) * softplus(aRaw + dtBias[head_idx])));
+    float gVal = expf(gStored);
+
+    half *last_recurrent_state = statePool != nullptr ?
+        (slotIds == nullptr ? statePool : statePool + (size_t)slotIds[batch_idx] * stateStride) :
+        last_recurrent_states[batch_idx];
+    int stateHeadBase = head_idx * headKDim * headVDim;
+
+    for (int idx = tid; idx < headKDim * headVDim; idx += blockDim.x) {
+        int state_idx = stateHeadBase + idx;
+        last_recurrent_state[state_idx] = __float2half_rn(__half2float(last_recurrent_state[state_idx]) * gVal);
+    }
+    __syncthreads();
+
+    if (tid < headVDim) {
+        float sum = 0.0f;
+        for (int j = 0; j < headKDim; j++) {
+            float kRaw = __half2float(convOutput[kOffset + j]);
+            float kNorm = __half2float(__float2half_rn(kRaw * kNormScale * normWeight[j]));
+            int state_idx = stateHeadBase + j * headVDim + tid;
+            sum += __half2float(last_recurrent_state[state_idx]) * kNorm;
+        }
+        kv_mem[tid] = sum;
+    }
+    __syncthreads();
+
+    if (tid < headVDim) {
+        float vVal = __half2float(convOutput[vOffset + tid]);
+        delta[tid] = (vVal - kv_mem[tid]) * bVal;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < headKDim * headVDim; idx += blockDim.x) {
+        int j = idx / headVDim;
+        int k = idx % headVDim;
+        float kRaw = __half2float(convOutput[kOffset + j]);
+        float kNorm = __half2float(__float2half_rn(kRaw * kNormScale * normWeight[j]));
+        int state_idx = stateHeadBase + idx;
+        float updated = __half2float(last_recurrent_state[state_idx]) + kNorm * delta[k];
+        last_recurrent_state[state_idx] = __float2half_rn(updated);
+    }
+    __syncthreads();
+
+    if (tid < headVDim) {
+        float sum = 0.0f;
+        half qScaleHalf = __float2half_rn(qScale);
+        for (int j = 0; j < headKDim; j++) {
+            float qRaw = __half2float(convOutput[qOffset + j]);
+            half qNormHalf = __float2half_rn(qRaw * qNormScale * normWeight[j]);
+            float qVal;
+            if (qScale != 1.0f) {
+#ifdef CUDA_NO_TENSOR_CORE
+                qVal = __half2float(__float2half(__half2float(qNormHalf) * __half2float(qScaleHalf)));
+#else
+                qVal = __half2float(__hmul(qNormHalf, qScaleHalf));
+#endif
+            } else {
+                qVal = __half2float(qNormHalf);
+            }
+            int state_idx = stateHeadBase + j * headVDim + tid;
+            sum += __half2float(last_recurrent_state[state_idx]) * qVal;
+        }
+        core_attn_out[(batch_idx * numVHeads + head_idx) * headVDim + tid] = __float2half_rn(sum);
+    }
+}
+
+template <int TILE_V>
+__global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel(
+    half **last_recurrent_states,
+    const half *convOutput,
+    const half *ba,
+    const float *normWeight,
+    const float *aLog,
+    const float *dtBias,
+    half *core_attn_out,
+    int batch, int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale,
+    half *statePool, const int *slotIds, int stateStride) {
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int v_base = blockIdx.z * TILE_V;
+    if (batch_idx >= batch || head_idx >= numVHeads || v_base >= headVDim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    int group = numVHeads / numKHeads;
+    int qHead = head_idx / group;
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    int convBase = batch_idx * qkvDim;
+    int qOffset = convBase + qHead * headKDim;
+    int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+    int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
+    int outBase = (batch_idx * numVHeads + head_idx) * headVDim;
+
+    extern __shared__ char shared_buf[];
+    float *q_norm = reinterpret_cast<float*>(shared_buf);
+    float *k_norm = q_norm + headKDim;
+    float *warp_q = k_norm + headKDim;
+    float *warp_k = warp_q + 2;
+    float *scales = warp_k + 2;
+    float *ba_values = scales + 2;
+
+    if (tid < 64) {
+        int norm_warp = tid >> 5;
+        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+        half2 qh = q_h2[tid];
+        half2 kh = k_h2[tid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+        }
+        if (lane_id == 0) {
+            warp_q[norm_warp] = q_sum2;
+            warp_k[norm_warp] = k_sum2;
+        }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        float q_val = tid < 2 ? warp_q[tid] : 0.0f;
+        float k_val = tid < 2 ? warp_k[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+        }
+        if (tid == 0) {
+            scales[0] = rsqrtf(q_val / headKDim + eps);
+            scales[1] = rsqrtf(k_val / headKDim + eps);
+        }
+    }
+    __syncthreads();
+
+    if (tid < 64) {
+        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+        half2 qh = q_h2[tid];
+        half2 kh = k_h2[tid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float w0 = __ldg(&normWeight[tid * 2]);
+        float w1 = __ldg(&normWeight[tid * 2 + 1]);
+        q_norm[tid * 2] = qf.x * scales[0] * w0;
+        q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
+        k_norm[tid * 2] = kf.x * scales[1] * w0;
+        k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
+    }
+
+    if (tid == 0) {
+        const half *baRow = ba + (size_t)batch_idx * (numVHeads * 2);
+        float bRaw = __half2float(baRow[head_idx]);
+        float aRaw = __half2float(baRow[numVHeads + head_idx]);
+        float gRaw = -__expf(aLog[head_idx]) * FastllmVllmOpsSoftplus(aRaw + dtBias[head_idx]);
+        ba_values[0] = 1.0f / (1.0f + __expf(-bRaw));
+        ba_values[1] = __expf(gRaw);
+    }
+    __syncthreads();
+
+    int v_col = v_base + warp_id;
+    if (warp_id >= TILE_V || v_col >= headVDim) {
+        return;
+    }
+
+    half *last_recurrent_state = statePool != nullptr ?
+        (slotIds == nullptr ? statePool : statePool + (size_t)slotIds[batch_idx] * stateStride) :
+        last_recurrent_states[batch_idx];
+    int stateHeadBase = head_idx * headKDim * headVDim;
+    half *state_row = last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim;
+    float gVal = ba_values[1];
+
+    float sumK = 0.0f;
+    for (int j = lane_id; j < headKDim; j += 32) {
+        sumK += (__half2float(state_row[j]) * gVal) * k_norm[j];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sumK += __shfl_down_sync(0xffffffff, sumK, offset);
+    }
+    float delta = (__half2float(convOutput[vOffset + v_col]) -
+                   __shfl_sync(0xffffffff, sumK, 0)) * ba_values[0];
+
+    float sumQ = 0.0f;
+    for (int j = lane_id; j < headKDim; j += 32) {
+        float updated = __half2float(state_row[j]) * gVal + k_norm[j] * delta;
+        state_row[j] = __float2half_rn(updated);
+        sumQ += updated * (q_norm[j] * qScale);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
+    }
+    if (lane_id == 0) {
+        core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
+    }
+}
+
+template <int TILE_V>
+__global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel(
+    const half *convOutput,
+    const half *ba,
+    const float *normWeight,
+    const float *aLog,
+    const float *dtBias,
+    half *last_recurrent_state,
+    half *core_attn_out,
+    int seqLen, int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    int head_idx = blockIdx.x;
+    int v_base = blockIdx.y * TILE_V;
+    if (head_idx >= numVHeads || v_base >= headVDim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    int group = numVHeads / numKHeads;
+    int qHead = head_idx / group;
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    int v_col = v_base + warp_id;
+    bool activeV = warp_id < TILE_V && v_col < headVDim;
+
+    extern __shared__ char shared_buf[];
+    float *q_norm = reinterpret_cast<float*>(shared_buf);
+    float *k_norm = q_norm + headKDim;
+    float *warp_q = k_norm + headKDim;
+    float *warp_k = warp_q + 2;
+    float *scales = warp_k + 2;
+    float *ba_values = scales + 2;
+
+    int stateHeadBase = head_idx * headKDim * headVDim;
+    half *state_row = activeV ?
+        last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim :
+        last_recurrent_state;
+
+    for (int token = 0; token < seqLen; token++) {
+        int convBase = token * qkvDim;
+        int qOffset = convBase + qHead * headKDim;
+        int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+        int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
+        int outBase = (token * numVHeads + head_idx) * headVDim;
+
+        if (tid < 64) {
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[tid];
+            half2 kh = k_h2[tid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+            float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+                k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+            }
+            if (lane_id == 0) {
+                int norm_warp = tid >> 5;
+                warp_q[norm_warp] = q_sum2;
+                warp_k[norm_warp] = k_sum2;
+            }
+        }
+        __syncthreads();
+
+        if (tid < 32) {
+            float q_val = tid < 2 ? warp_q[tid] : 0.0f;
+            float k_val = tid < 2 ? warp_k[tid] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+                k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+            }
+            if (tid == 0) {
+                scales[0] = rsqrtf(q_val / headKDim + eps);
+                scales[1] = rsqrtf(k_val / headKDim + eps);
+            }
+        }
+        __syncthreads();
+
+        if (tid < 64) {
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[tid];
+            half2 kh = k_h2[tid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float w0 = __ldg(&normWeight[tid * 2]);
+            float w1 = __ldg(&normWeight[tid * 2 + 1]);
+            q_norm[tid * 2] = qf.x * scales[0] * w0;
+            q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
+            k_norm[tid * 2] = kf.x * scales[1] * w0;
+            k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
+        }
+
+        if (tid == 0) {
+            const half *baRow = ba + (size_t)token * (numVHeads * 2);
+            float bRaw = __half2float(baRow[head_idx]);
+            float aRaw = __half2float(baRow[numVHeads + head_idx]);
+            float gRaw = -__expf(aLog[head_idx]) * FastllmVllmOpsSoftplus(aRaw + dtBias[head_idx]);
+            ba_values[0] = 1.0f / (1.0f + __expf(-bRaw));
+            ba_values[1] = __expf(gRaw);
+        }
+        __syncthreads();
+
+        if (activeV) {
+            float gVal = ba_values[1];
+            float sumK = 0.0f;
+            for (int j = lane_id; j < headKDim; j += 32) {
+                sumK += (__half2float(state_row[j]) * gVal) * k_norm[j];
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sumK += __shfl_down_sync(0xffffffff, sumK, offset);
+            }
+            float delta = (__half2float(convOutput[vOffset + v_col]) -
+                           __shfl_sync(0xffffffff, sumK, 0)) * ba_values[0];
+
+            float sumQ = 0.0f;
+            for (int j = lane_id; j < headKDim; j += 32) {
+                float updated = __half2float(state_row[j]) * gVal + k_norm[j] * delta;
+                state_row[j] = __float2half_rn(updated);
+                sumQ += updated * (q_norm[j] * qScale);
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
+            }
+            if (lane_id == 0) {
+                core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
+    fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (cudaStatePointers == nullptr || batch <= 0 ||
+        convOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        ba.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        aLog.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
+        first_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+        convOutput.dataType != fastllm::DataType::FLOAT16 ||
+        ba.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        first_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        convOutput.cudaData == nullptr ||
+        ba.cudaData == nullptr ||
+        first_recurrent_state.cudaData == nullptr) {
+        return false;
+    }
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    if (numKHeads <= 0 || numVHeads <= 0 || headKDim <= 0 || headVDim <= 0 ||
+        numVHeads % numKHeads != 0 ||
+        convOutput.dims.empty() || convOutput.dims.back() != qkvDim ||
+        ba.dims.empty() || ba.dims.back() != numVHeads * 2 ||
+        normWeight.dims.size() != 1 || normWeight.dims[0] != headKDim ||
+        aLog.dims.size() != 1 || aLog.dims[0] != numVHeads ||
+        dtBias.dims.size() != 1 || dtBias.dims[0] != numVHeads ||
+        first_recurrent_state.dims.size() != 4 ||
+        first_recurrent_state.dims[0] != 1 ||
+        first_recurrent_state.dims[1] != numVHeads ||
+        first_recurrent_state.dims[2] != headKDim ||
+        first_recurrent_state.dims[3] != headVDim) {
+        return false;
+    }
+
+    core_attn_out.dataType = first_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = first_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({batch, numVHeads, 1, headVDim});
+    core_attn_out.Allocate(false);
+
+    int threadsPerBlock = 256;
+    int numWarps = (threadsPerBlock + 31) / 32;
+    size_t sharedMemSize = (2 * headVDim + 2 * numWarps + 2) * sizeof(float);
+    dim3 gridDim(batch, numVHeads);
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel<<<gridDim, threadsPerBlock, sharedMemSize>>>(
+        (half**)cudaStatePointers,
+        (const half*)convOutput.cudaData,
+        (const half*)ba.cudaData,
+        (const float*)normWeight.cudaData,
+        (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData,
+        (half*)core_attn_out.cudaData,
+        batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        nullptr, nullptr, 0
+    );
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
+    fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (cudaStatePointers == nullptr || batch <= 0 ||
+        convOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        ba.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        aLog.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
+        first_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+        convOutput.dataType != fastllm::DataType::FLOAT16 ||
+        ba.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        first_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        !first_recurrent_state.isLinearAttentionTransposed ||
+        convOutput.cudaData == nullptr ||
+        ba.cudaData == nullptr ||
+        first_recurrent_state.cudaData == nullptr) {
+        return false;
+    }
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    if (numKHeads <= 0 || numVHeads <= 0 || headKDim != 128 || headVDim <= 0 ||
+        numVHeads % numKHeads != 0 ||
+        convOutput.dims.empty() || convOutput.dims.back() != qkvDim ||
+        ba.dims.empty() || ba.dims.back() != numVHeads * 2 ||
+        normWeight.dims.size() != 1 || normWeight.dims[0] != headKDim ||
+        aLog.dims.size() != 1 || aLog.dims[0] != numVHeads ||
+        dtBias.dims.size() != 1 || dtBias.dims[0] != numVHeads ||
+        first_recurrent_state.dims.size() != 4 ||
+        first_recurrent_state.dims[0] != 1 ||
+        first_recurrent_state.dims[1] != numVHeads ||
+        first_recurrent_state.dims[2] != headKDim ||
+        first_recurrent_state.dims[3] != headVDim) {
+        return false;
+    }
+
+    core_attn_out.dataType = first_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = first_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({batch, numVHeads, 1, headVDim});
+    core_attn_out.Allocate(false);
+
+    constexpr int tileV = 8;
+    int threadsPerBlock = tileV * 32;
+    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 gridDim(batch, numVHeads, (headVDim + tileV - 1) / tileV);
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+        (half**)cudaStatePointers,
+        (const half*)convOutput.cudaData,
+        (const half*)ba.cudaData,
+        (const float*)normWeight.cudaData,
+        (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData,
+        (half*)core_attn_out.cudaData,
+        batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        nullptr, nullptr, 0
+    );
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (convOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        ba.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        aLog.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
+        last_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+        convOutput.dataType != fastllm::DataType::FLOAT16 ||
+        ba.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        !last_recurrent_state.isLinearAttentionTransposed ||
+        convOutput.cudaData == nullptr ||
+        ba.cudaData == nullptr ||
+        last_recurrent_state.cudaData == nullptr) {
+        return false;
+    }
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    if (numKHeads <= 0 || numVHeads <= 0 || headKDim != 128 || headVDim <= 0 ||
+        numVHeads % numKHeads != 0 ||
+        convOutput.dims.empty() || convOutput.dims.back() != qkvDim ||
+        ba.dims.empty() || ba.dims.back() != numVHeads * 2 ||
+        normWeight.dims.size() != 1 || normWeight.dims[0] != headKDim ||
+        aLog.dims.size() != 1 || aLog.dims[0] != numVHeads ||
+        dtBias.dims.size() != 1 || dtBias.dims[0] != numVHeads ||
+        last_recurrent_state.dims.size() != 4 ||
+        last_recurrent_state.dims[0] != 1 ||
+        last_recurrent_state.dims[1] != numVHeads ||
+        last_recurrent_state.dims[2] != headKDim ||
+        last_recurrent_state.dims[3] != headVDim) {
+        return false;
+    }
+
+    core_attn_out.dataType = last_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = last_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({1, numVHeads, 1, headVDim});
+    core_attn_out.Allocate(false);
+
+    constexpr int tileV = 8;
+    int threadsPerBlock = tileV * 32;
+    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 gridDim(1, numVHeads, (headVDim + tileV - 1) / tileV);
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+        nullptr,
+        (const half*)convOutput.cudaData,
+        (const half*)ba.cudaData,
+        (const float*)normWeight.cudaData,
+        (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData,
+        (half*)core_attn_out.cudaData,
+        1, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        (half*)last_recurrent_state.cudaData, nullptr, 0
+    );
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (convOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        ba.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        aLog.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
+        last_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+        convOutput.dataType != fastllm::DataType::FLOAT16 ||
+        ba.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        !last_recurrent_state.isLinearAttentionTransposed ||
+        convOutput.cudaData == nullptr ||
+        ba.cudaData == nullptr ||
+        last_recurrent_state.cudaData == nullptr) {
+        return false;
+    }
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    if (numKHeads <= 0 || numVHeads <= 0 || headKDim != 128 || headVDim <= 0 ||
+        numVHeads % numKHeads != 0 ||
+        convOutput.dims.size() != 3 || convOutput.dims[0] != 1 ||
+        convOutput.dims.back() != qkvDim ||
+        ba.dims.size() != 3 || ba.dims[0] != 1 ||
+        ba.dims.back() != numVHeads * 2 ||
+        convOutput.dims[1] != ba.dims[1] ||
+        convOutput.dims[1] <= 1 || convOutput.dims[1] > 4 ||
+        normWeight.dims.size() != 1 || normWeight.dims[0] != headKDim ||
+        aLog.dims.size() != 1 || aLog.dims[0] != numVHeads ||
+        dtBias.dims.size() != 1 || dtBias.dims[0] != numVHeads ||
+        last_recurrent_state.dims.size() != 4 ||
+        last_recurrent_state.dims[0] != 1 ||
+        last_recurrent_state.dims[1] != numVHeads ||
+        last_recurrent_state.dims[2] != headKDim ||
+        last_recurrent_state.dims[3] != headVDim) {
+        return false;
+    }
+
+    int seqLen = convOutput.dims[1];
+    core_attn_out.dataType = last_recurrent_state.dataType;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = last_recurrent_state.dataDeviceIds;
+    core_attn_out.Resize({1, seqLen, numVHeads, headVDim});
+    core_attn_out.Allocate(false);
+
+    constexpr int tileV = 8;
+    int threadsPerBlock = tileV * 32;
+    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 gridDim(numVHeads, (headVDim + tileV - 1) / tileV);
+
+    FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+        (const half*)convOutput.cudaData,
+        (const half*)ba.cudaData,
+        (const float*)normWeight.cudaData,
+        (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData,
+        (half*)last_recurrent_state.cudaData,
+        (half*)core_attn_out.cudaData,
+        seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale
+    );
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    void *cudaStatePool, void *cudaSlotIds, int batch,
+    fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (cudaStatePool == nullptr || cudaSlotIds == nullptr || batch <= 0 ||
+        convOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        ba.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        aLog.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
+        convOutput.dataType != fastllm::DataType::FLOAT16 ||
+        ba.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        convOutput.cudaData == nullptr ||
+        ba.cudaData == nullptr) {
+        return false;
+    }
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    if (numKHeads <= 0 || numVHeads <= 0 || headKDim != 128 || headVDim <= 0 ||
+        numVHeads % numKHeads != 0 ||
+        convOutput.dims.empty() || convOutput.dims.back() != qkvDim ||
+        ba.dims.empty() || ba.dims.back() != numVHeads * 2 ||
+        normWeight.dims.size() != 1 || normWeight.dims[0] != headKDim ||
+        aLog.dims.size() != 1 || aLog.dims[0] != numVHeads ||
+        dtBias.dims.size() != 1 || dtBias.dims[0] != numVHeads) {
+        return false;
+    }
+
+    core_attn_out.dataType = fastllm::DataType::FLOAT16;
+    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
+    core_attn_out.dataDeviceIds = convOutput.dataDeviceIds;
+    core_attn_out.Resize({batch, numVHeads, 1, headVDim});
+    core_attn_out.Allocate(false);
+
+    constexpr int tileV = 8;
+    int threadsPerBlock = tileV * 32;
+    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 gridDim(batch, numVHeads, (headVDim + tileV - 1) / tileV);
+    int stateStride = numVHeads * headVDim * headKDim;
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+        nullptr,
+        (const half*)convOutput.cudaData,
+        (const half*)ba.cudaData,
+        (const float*)normWeight.cudaData,
+        (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData,
+        (half*)core_attn_out.cudaData,
+        batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        (half*)cudaStatePool, (const int*)cudaSlotIds, stateStride
+    );
+
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots.", cudaGetLastError());
+    return true;
+}
+
+void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    int batch = (int)last_recurrent_states.size();
+    void **cpuPointers = new void*[batch];
+    for (int i = 0; i < batch; i++) {
+        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+    }
+    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
+    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
+    delete[] cpuPointers;
+    checkCudaErrors("Error: CUDA error when copy recurrent state pointers to GPU!", state);
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
+        convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
+        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+    FastllmCudaFree(cudaPointers);
+}
+
+void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    int batch = (int)last_recurrent_states.size();
+    void **cpuPointers = new void*[batch];
+    for (int i = 0; i < batch; i++) {
+        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+    }
+    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
+    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
+    delete[] cpuPointers;
+    checkCudaErrors("Error: CUDA error when copy transposed recurrent state pointers to GPU!", state);
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
+        convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
+        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+    FastllmCudaFree(cudaPointers);
+}
+
+
 template<int THREAD_PER_BLOCK>
 __global__ void FastllmVllmOpsShiftAppendWindowKernel(
     uint8_t *cache,
